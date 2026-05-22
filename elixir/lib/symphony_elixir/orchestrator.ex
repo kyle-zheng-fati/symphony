@@ -227,7 +227,7 @@ defmodule SymphonyElixir.Orchestrator do
     if input_required_blocker?(running_entry) do
       block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
     else
-      if turn_guard_blocker?(running_entry) do
+      if turn_guard_blocker?(running_entry, reason) do
         block_turn_guard_agent_down(state, issue_id, running_entry, session_id, reason)
       else
         retry_agent_down(state, issue_id, running_entry, session_id, reason)
@@ -236,18 +236,54 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp block_turn_guard_agent_down(state, issue_id, running_entry, session_id, reason) do
-    error = blocker_error(running_entry, "agent exited after Codex turn guard failed: #{inspect(reason)}")
+    error =
+      blocker_error(
+        running_entry,
+        turn_guard_exit_error(reason) || "agent exited after Codex turn guard failed: #{inspect(reason)}"
+      )
 
     Logger.warning("Agent task blocked by Codex turn guard for issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} session_id=#{session_id}: #{error}")
 
     block_issue_from_entry(state, issue_id, running_entry, error)
   end
 
-  defp turn_guard_blocker?(running_entry) when is_map(running_entry) do
-    Map.get(running_entry, :last_codex_event) == :turn_guard_failed
+  defp turn_guard_blocker?(running_entry, reason) when is_map(running_entry) do
+    Map.get(running_entry, :last_codex_event) == :turn_guard_failed or guard_exit_reason?(reason)
   end
 
-  defp turn_guard_blocker?(_running_entry), do: false
+  defp turn_guard_blocker?(_running_entry, reason), do: guard_exit_reason?(reason)
+
+  defp guard_exit_reason?(reason) do
+    reason
+    |> inspect(limit: :infinity)
+    |> guard_reason_text?()
+  end
+
+  defp guard_reason_text?(text) when is_binary(text) do
+    Enum.any?(
+      [
+        "codex_command_isolation_violation",
+        "codex_token_budget_exceeded",
+        "codex_token_delta_budget_exceeded",
+        "codex_output_delta_budget_exceeded",
+        "codex_command_event_budget_exceeded"
+      ],
+      &String.contains?(text, &1)
+    )
+  end
+
+  defp turn_guard_exit_error(reason) do
+    turn_guard_reason_from_term(reason) ||
+      if(guard_exit_reason?(reason),
+        do: "agent exited after Codex turn guard failed: #{inspect(reason, limit: :infinity)}",
+        else: nil
+      )
+  end
+
+  defp turn_guard_reason_from_term({:shutdown, reason}), do: turn_guard_reason_from_term(reason)
+  defp turn_guard_reason_from_term({:error, reason}), do: turn_guard_reason_from_term(reason)
+  defp turn_guard_reason_from_term({reason, _stack}) when is_tuple(reason), do: turn_guard_reason_from_term(reason)
+  defp turn_guard_reason_from_term(reason), do: turn_guard_reason_text(reason)
 
   defp block_input_required_agent_down(state, issue_id, running_entry, session_id, reason) do
     error = blocker_error(running_entry, "agent exited: #{inspect(reason)}")
@@ -775,6 +811,22 @@ defmodule SymphonyElixir.Orchestrator do
           "bug_class" => "workflow_boundary",
           "summary" => "Worker attempted host-wide discovery outside issue isolation.",
           "command" => command_from_guard_reason(reason) || broad_command_from_events(recent_events)
+        }
+
+      String.contains?(error_text, "command output budget") or
+          String.contains?(error_text, "codex_output_delta_budget_exceeded") ->
+        %{
+          "layer" => "command_output",
+          "bug_class" => "unbounded_command_output",
+          "summary" => "Codex command output exceeded configured delta guard."
+        }
+
+      String.contains?(error_text, "command event budget") or
+          String.contains?(error_text, "codex_command_event_budget_exceeded") ->
+        %{
+          "layer" => "command_output",
+          "bug_class" => "too_many_command_events",
+          "summary" => "Codex command event count exceeded configured guard."
         }
 
       String.contains?(error_text, "token budget") and not is_nil(broad_command_from_events(recent_events)) ->

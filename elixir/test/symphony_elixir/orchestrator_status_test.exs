@@ -769,6 +769,97 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              block_provenance["token_jumps"]
   end
 
+  test "orchestrator blocks codex output guard exits even without a final guard event" do
+    issue_id = "issue-output-guard-exit"
+
+    workspace_path =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-output-guard-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(workspace_path)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MMO-4",
+      title: "Output guard exit",
+      description: "Guard exits should preserve the boundary failure instead of retrying",
+      state: "In Progress",
+      url: "https://example.org/issues/MMO-4"
+    }
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      codex_max_command_output_delta_bytes: 200_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    orchestrator_name = Module.concat(__MODULE__, :OutputGuardExitOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      File.rm_rf(workspace_path)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    ref = make_ref()
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: issue.identifier,
+      issue: issue,
+      workspace_path: workspace_path,
+      session_id: "thread-output-turn-output",
+      last_codex_message: nil,
+      last_codex_timestamp: started_at,
+      last_codex_event: nil,
+      codex_recent_events: [
+        %{"method" => "item/commandExecution/outputDelta", "output_delta_bytes" => 200_279}
+      ],
+      started_at: started_at
+    }
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:DOWN, ref, :process, self(), {:shutdown, {:codex_output_delta_budget_exceeded, 200_279, 200_000, "item/commandExecution/outputDelta"}}}
+    )
+
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
+
+    assert %{
+             identifier: "MMO-4",
+             error: "codex command output budget exceeded: 200279 > 200000 via item/commandExecution/outputDelta"
+           } = state.blocked[issue_id]
+
+    block_provenance_path = Path.join(workspace_path, ".symphony/block_provenance.json")
+    assert File.exists?(block_provenance_path)
+    assert {:ok, block_provenance} = block_provenance_path |> File.read!() |> Jason.decode()
+    assert block_provenance["reason"] =~ "codex command output budget exceeded"
+    assert block_provenance["block_classification"]["layer"] == "command_output"
+    assert block_provenance["block_classification"]["bug_class"] == "unbounded_command_output"
+    assert block_provenance["codex_max_command_output_delta_bytes"] == 200_000
+  end
+
   test "orchestrator token accounting ignores last_token_usage without cumulative totals" do
     issue_id = "issue-last-token-ignored"
 
