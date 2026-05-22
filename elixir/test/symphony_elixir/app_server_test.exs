@@ -367,9 +367,12 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-retry"}}}'
+            # initialized notification; no response expected
             ;;
           3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-retry"}}}'
+            ;;
+          4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-retry"}}}'
             printf '%s\\n' '{"method":"error","params":{"message":"Reconnecting... 2/5","willRetry":true,"error":{"additionalDetails":"stream disconnected before completion: websocket closed by server before response.completed","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":null}}}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
