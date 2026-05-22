@@ -17,6 +17,7 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
+    assert config.agent.max_issue_description_chars == 6_000
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -36,6 +37,13 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_issue_description_chars: -1)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_issue_description_chars"
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_issue_description_chars: 0)
+    assert Config.settings!().agent.max_issue_description_chars == 0
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
@@ -933,11 +941,13 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "You are working on a Linear issue."
     assert prompt =~ "Identifier: MT-777"
     assert prompt =~ "Title: Make fallback prompt useful"
-    assert prompt =~ "Body:"
+    assert prompt =~ "Compiled issue brief:"
+    assert prompt =~ "Signature: SymphonyIssueBriefV1"
     assert prompt =~ "Include enough issue context to start working."
     assert Config.workflow_prompt() =~ "{{ issue.identifier }}"
     assert Config.workflow_prompt() =~ "{{ issue.title }}"
-    assert Config.workflow_prompt() =~ "{{ issue.description }}"
+    assert Config.workflow_prompt() =~ "{{ issue.brief }}"
+    assert Config.workflow_prompt() =~ "{{ issue.context_provenance }}"
   end
 
   test "prompt builder default template handles missing issue body" do
@@ -957,6 +967,29 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Identifier: MT-778"
     assert prompt =~ "Title: Handle empty body"
     assert prompt =~ "No description provided."
+  end
+
+  test "prompt builder caps raw issue body and exposes provenance" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      max_issue_description_chars: 24,
+      prompt: "{{ issue.brief }}\n\n{{ issue.context_provenance }}"
+    )
+
+    issue = %Issue{
+      identifier: "MT-779",
+      title: "Cap body",
+      description: "Must keep this compact. " <> String.duplicate("overflow ", 40),
+      state: "Todo",
+      url: "https://example.org/issues/MT-779",
+      labels: ["prompt"]
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+
+    assert prompt =~ "Signature: SymphonyIssueBriefV1"
+    assert prompt =~ "description_truncated=true"
+    assert prompt =~ "max_issue_description_chars=24"
+    refute prompt =~ "overflow overflow overflow overflow overflow"
   end
 
   test "prompt builder reports workflow load failures separately from template parse errors" do
@@ -1118,6 +1151,12 @@ defmodule SymphonyElixir.CoreTest do
       workspace = Path.join(workspace_root, workspace_name)
       assert File.exists?(workspace)
       assert File.exists?(Path.join(workspace, "README.md"))
+
+      provenance_path = Path.join(workspace, ".symphony/prompt_provenance.json")
+      assert File.exists?(provenance_path)
+      assert {:ok, provenance} = provenance_path |> File.read!() |> Jason.decode()
+      assert provenance["signature"] == "SymphonyIssueBriefV1"
+      assert provenance["compiler_contract"] == "dspy-compatible-signature"
     after
       File.rm_rf(test_root)
     end
@@ -1553,6 +1592,8 @@ defmodule SymphonyElixir.CoreTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         tracker_kind: "memory",
         workspace_root: workspace_root,
+        hook_after_create:
+          "git init && git config user.email test@example.invalid && git config user.name 'Test User' && printf 'clean\\n' > README.md && git add README.md && git commit -m initial >/dev/null",
         codex_command: "#{codex_binary} app-server",
         max_turns: 3
       )

@@ -3,22 +3,35 @@ defmodule SymphonyElixir.PromptBuilder do
   Builds agent prompts from Linear issue data.
   """
 
-  alias SymphonyElixir.{Config, Workflow}
+  alias SymphonyElixir.{Config, IssueBrief, Workflow}
 
   @render_opts [strict_variables: true, strict_filters: true]
 
   @spec build_prompt(SymphonyElixir.Linear.Issue.t(), keyword()) :: String.t()
   def build_prompt(issue, opts \\ []) do
+    workflow = Workflow.current()
+
     template =
-      Workflow.current()
+      workflow
       |> prompt_template!()
       |> parse_template!()
+
+    settings = Config.settings!()
+    compiled_issue = IssueBrief.compile(issue, max_description_chars: settings.agent.max_issue_description_chars)
 
     template
     |> Solid.render!(
       %{
         "attempt" => Keyword.get(opts, :attempt),
-        "issue" => issue |> Map.from_struct() |> to_solid_map()
+        "issue" =>
+          issue
+          |> Map.from_struct()
+          |> Map.merge(%{
+            brief: compiled_issue.brief,
+            context_provenance: compiled_issue.provenance_text,
+            prompt_provenance: compiled_issue.provenance
+          })
+          |> to_solid_map()
       },
       @render_opts
     )

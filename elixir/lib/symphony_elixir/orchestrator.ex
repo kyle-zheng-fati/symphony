@@ -15,6 +15,7 @@ defmodule SymphonyElixir.Orchestrator do
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
+  @block_provenance_relative_path Path.join([".symphony", "block_provenance.json"])
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -781,8 +782,18 @@ defmodule SymphonyElixir.Orchestrator do
       blocked_at: DateTime.utc_now(),
       last_codex_message: Map.get(running_entry, :last_codex_message),
       last_codex_event: Map.get(running_entry, :last_codex_event),
-      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp)
+      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
+      codex_input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
+      codex_output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
+      codex_total_tokens: Map.get(running_entry, :codex_total_tokens, 0),
+      codex_last_reported_input_tokens: Map.get(running_entry, :codex_last_reported_input_tokens, 0),
+      codex_last_reported_output_tokens: Map.get(running_entry, :codex_last_reported_output_tokens, 0),
+      codex_last_reported_total_tokens: Map.get(running_entry, :codex_last_reported_total_tokens, 0),
+      codex_max_reported_tokens: Config.settings!().codex.max_reported_tokens || 0,
+      codex_max_command_output_delta_bytes: Config.settings!().codex.max_command_output_delta_bytes || 0
     }
+
+    write_block_provenance(blocked_entry)
 
     %{
       state
@@ -792,6 +803,121 @@ defmodule SymphonyElixir.Orchestrator do
         blocked: Map.put(state.blocked, issue_id, blocked_entry)
     }
   end
+
+  defp write_block_provenance(blocked_entry) do
+    issue_id = Map.get(blocked_entry, :issue_id)
+
+    if is_binary(issue_id) do
+      comment = block_provenance_comment(blocked_entry)
+      write_workspace_block_provenance(blocked_entry)
+
+      case Tracker.create_comment(issue_id, comment) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          Logger.warning("Failed to write block provenance for issue_id=#{issue_id}: #{inspect(reason)}")
+      end
+
+      case update_issue_state_candidates(issue_id, ["Human Review", "In Review"]) do
+        :ok ->
+          :ok
+
+        {:error, reason} ->
+          Logger.warning("Failed to route blocked issue for issue_id=#{issue_id}: #{inspect(reason)}")
+      end
+    end
+  end
+
+  defp write_workspace_block_provenance(blocked_entry) do
+    case Map.get(blocked_entry, :workspace_path) do
+      workspace_path when is_binary(workspace_path) and workspace_path != "" ->
+        path = Path.join(workspace_path, @block_provenance_relative_path)
+
+        payload = %{
+          "schema" => "SymphonyBlockProvenanceV1",
+          "path" => @block_provenance_relative_path,
+          "issue_id" => Map.get(blocked_entry, :issue_id),
+          "identifier" => Map.get(blocked_entry, :identifier),
+          "session_id" => Map.get(blocked_entry, :session_id),
+          "worker_host" => Map.get(blocked_entry, :worker_host),
+          "workspace_path" => workspace_path,
+          "blocked_at" => blocked_at_text(Map.get(blocked_entry, :blocked_at)),
+          "reason" => Map.get(blocked_entry, :error),
+          "last_codex_event" => codex_event_name(Map.get(blocked_entry, :last_codex_event)),
+          "last_codex_timestamp" => timestamp_text(Map.get(blocked_entry, :last_codex_timestamp)),
+          "codex_input_tokens" => Map.get(blocked_entry, :codex_input_tokens, 0),
+          "codex_output_tokens" => Map.get(blocked_entry, :codex_output_tokens, 0),
+          "codex_total_tokens" => Map.get(blocked_entry, :codex_total_tokens, 0),
+          "codex_last_reported_input_tokens" => Map.get(blocked_entry, :codex_last_reported_input_tokens, 0),
+          "codex_last_reported_output_tokens" => Map.get(blocked_entry, :codex_last_reported_output_tokens, 0),
+          "codex_last_reported_total_tokens" => Map.get(blocked_entry, :codex_last_reported_total_tokens, 0),
+          "codex_max_reported_tokens" => Map.get(blocked_entry, :codex_max_reported_tokens, 0),
+          "codex_max_command_output_delta_bytes" => Map.get(blocked_entry, :codex_max_command_output_delta_bytes, 0)
+        }
+
+        with :ok <- File.mkdir_p(Path.dirname(path)),
+             :ok <- File.write(path, Jason.encode!(payload, pretty: true)) do
+          :ok
+        else
+          {:error, reason} ->
+            Logger.warning("Failed to write block provenance file path=#{path}: #{inspect(reason)}")
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp block_provenance_comment(blocked_entry) do
+    event = Map.get(blocked_entry, :last_codex_event)
+
+    [
+      "## Symphony Blocked This Issue",
+      "",
+      "- identifier: #{Map.get(blocked_entry, :identifier) || Map.get(blocked_entry, :issue_id)}",
+      "- session_id: #{Map.get(blocked_entry, :session_id) || "unknown"}",
+      "- worker_host: #{Map.get(blocked_entry, :worker_host) || "local"}",
+      "- workspace_path: #{Map.get(blocked_entry, :workspace_path) || "unknown"}",
+      "- blocked_at: #{blocked_at_text(Map.get(blocked_entry, :blocked_at))}",
+      "- reason: #{Map.get(blocked_entry, :error) || "unknown"}",
+      "- last_codex_event: #{codex_event_name(event)}",
+      "- last_codex_timestamp: #{timestamp_text(Map.get(blocked_entry, :last_codex_timestamp))}",
+      "- codex_reported_tokens: #{Map.get(blocked_entry, :codex_last_reported_total_tokens, 0)}/#{Map.get(blocked_entry, :codex_max_reported_tokens, 0)}",
+      "- codex_accumulated_tokens: #{Map.get(blocked_entry, :codex_total_tokens, 0)}",
+      "- block_provenance_path: #{@block_provenance_relative_path}",
+      "",
+      "The issue was moved to Human Review/In Review so Symphony does not silently redispatch it. After reducing prompt/context/output pressure or fixing the blocker, move it back to an active state intentionally."
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp update_issue_state_candidates(issue_id, [state_name | rest]) do
+    case Tracker.update_issue_state(issue_id, state_name) do
+      :ok ->
+        :ok
+
+      {:error, :state_not_found} when rest != [] ->
+        update_issue_state_candidates(issue_id, rest)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp update_issue_state_candidates(_issue_id, []), do: {:error, :state_not_found}
+
+  defp blocked_at_text(%DateTime{} = blocked_at), do: DateTime.to_iso8601(blocked_at)
+  defp blocked_at_text(_blocked_at), do: "unknown"
+
+  defp timestamp_text(%DateTime{} = timestamp), do: DateTime.to_iso8601(timestamp)
+  defp timestamp_text(_timestamp), do: "unknown"
+
+  defp codex_event_name(%{event: event}) when is_atom(event), do: Atom.to_string(event)
+  defp codex_event_name(%{event: event}) when is_binary(event), do: event
+  defp codex_event_name(%{"method" => method}) when is_binary(method), do: method
+  defp codex_event_name(%{method: method}) when is_binary(method), do: method
+  defp codex_event_name(_event), do: "unknown"
 
   defp choose_issues(issues, state) do
     active_states = active_state_set()

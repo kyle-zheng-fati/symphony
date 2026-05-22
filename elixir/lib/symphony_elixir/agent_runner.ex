@@ -5,9 +5,15 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, IssueBrief, Linear.Issue, PromptBuilder, Tracker, Workspace}
 
   @outcome_relative_path Path.join([".symphony", "outcome.json"])
+  @prompt_provenance_relative_path Path.join([".symphony", "prompt_provenance.json"])
+  @internal_artifact_relative_paths [
+    @outcome_relative_path,
+    @prompt_provenance_relative_path,
+    Path.join([".symphony", "block_provenance.json"])
+  ]
 
   @type worker_host :: String.t() | nil
 
@@ -103,7 +109,8 @@ defmodule SymphonyElixir.AgentRunner do
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
-    with {:ok, turn_session} <-
+    with :ok <- maybe_write_prompt_provenance(workspace, issue, turn_number),
+         {:ok, turn_session} <-
            AppServer.run_turn(
              app_session,
              prompt,
@@ -236,12 +243,16 @@ defmodule SymphonyElixir.AgentRunner do
       {output, 0} ->
         output
         |> String.split("\n", trim: true)
-        |> Enum.reject(&String.ends_with?(&1, @outcome_relative_path))
+        |> Enum.reject(&internal_artifact_status_line?/1)
         |> Enum.any?()
 
       _ ->
         false
     end
+  end
+
+  defp internal_artifact_status_line?(line) do
+    Enum.any?(@internal_artifact_relative_paths, &String.ends_with?(line, &1))
   end
 
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
@@ -257,6 +268,30 @@ defmodule SymphonyElixir.AgentRunner do
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
     """
   end
+
+  defp maybe_write_prompt_provenance(workspace, %Issue{} = issue, 1) when is_binary(workspace) do
+    settings = Config.settings!()
+    compiled_issue = IssueBrief.compile(issue, max_description_chars: settings.agent.max_issue_description_chars)
+    path = Path.join(workspace, @prompt_provenance_relative_path)
+
+    payload =
+      compiled_issue.provenance
+      |> Map.put("issue_identifier", issue.identifier)
+      |> Map.put("issue_id", issue.id)
+      |> Map.put("issue_title", issue.title)
+      |> Map.put("issue_state", issue.state)
+      |> Map.put("issue_url", issue.url)
+      |> Map.put("path", @prompt_provenance_relative_path)
+
+    with :ok <- File.mkdir_p(Path.dirname(path)),
+         :ok <- File.write(path, Jason.encode!(payload, pretty: true)) do
+      :ok
+    else
+      {:error, reason} -> {:error, {:prompt_provenance_write_failed, path, reason}}
+    end
+  end
+
+  defp maybe_write_prompt_provenance(_workspace, _issue, _turn_number), do: :ok
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do

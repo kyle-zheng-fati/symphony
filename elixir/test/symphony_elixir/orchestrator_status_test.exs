@@ -633,6 +633,14 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   test "orchestrator blocks and stops a codex worker that exceeds reported token budget" do
     issue_id = "issue-orchestrator-token-budget"
 
+    workspace_path =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-block-provenance-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(workspace_path)
+
     issue = %Issue{
       id: issue_id,
       identifier: "MT-224",
@@ -642,7 +650,12 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       url: "https://example.org/issues/MT-224"
     }
 
-    write_workflow_file!(Workflow.workflow_file_path(), codex_max_reported_tokens: 300_000)
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      codex_max_reported_tokens: 300_000
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
 
     orchestrator_name = Module.concat(__MODULE__, :TokenBudgetGuardOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
@@ -655,6 +668,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       end)
 
     on_exit(fn ->
+      File.rm_rf(workspace_path)
+
       if Process.alive?(worker_pid), do: Process.exit(worker_pid, :kill)
 
       if Process.alive?(pid) do
@@ -671,6 +686,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       ref: process_ref,
       identifier: issue.identifier,
       issue: issue,
+      workspace_path: workspace_path,
       session_id: "thread-budget-turn-budget",
       last_codex_message: nil,
       last_codex_timestamp: nil,
@@ -689,6 +705,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       |> Map.put(:running, %{issue_id => running_entry})
       |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
     end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
 
     send(
       pid,
@@ -725,6 +743,21 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert blocked_entry.error == "codex reported token budget exceeded: 325001 > 300000"
     refute Process.alive?(worker_pid)
     assert state.codex_totals.total_tokens == 325_001
+    assert_receive {:memory_tracker_comment, ^issue_id, block_comment}, 500
+    assert block_comment =~ "## Symphony Blocked This Issue"
+    assert block_comment =~ "codex reported token budget exceeded: 325001 > 300000"
+    assert block_comment =~ "thread-budget-turn-budget"
+    assert block_comment =~ "codex_reported_tokens: 325001/300000"
+    assert block_comment =~ ".symphony/block_provenance.json"
+    assert_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}, 500
+
+    block_provenance_path = Path.join(workspace_path, ".symphony/block_provenance.json")
+    assert File.exists?(block_provenance_path)
+    assert {:ok, block_provenance} = block_provenance_path |> File.read!() |> Jason.decode()
+    assert block_provenance["schema"] == "SymphonyBlockProvenanceV1"
+    assert block_provenance["reason"] == "codex reported token budget exceeded: 325001 > 300000"
+    assert block_provenance["codex_last_reported_total_tokens"] == 325_001
+    assert block_provenance["codex_max_reported_tokens"] == 300_000
   end
 
   test "orchestrator token accounting ignores last_token_usage without cumulative totals" do
