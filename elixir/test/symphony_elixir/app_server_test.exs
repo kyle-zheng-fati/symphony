@@ -1195,6 +1195,207 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server fails loudly when reported token budget is exceeded" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-token-budget-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-94")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-94"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-94"}}}'
+            printf '%s\\n' '{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"input":10,"output":1,"total":11}}}'
+            sleep 5
+            ;;
+          *)
+            sleep 5
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_max_reported_tokens: 10
+      )
+
+      issue = %Issue{
+        id: "issue-token-budget",
+        identifier: "MT-94",
+        title: "Token budget",
+        description: "Ensure runaway token usage fails before draining quota",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-94",
+        labels: ["backend"]
+      }
+
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      assert {:error, {:codex_token_budget_exceeded, 11, 10}} =
+               AppServer.run(workspace, "Trip token budget", issue, on_message: on_message)
+
+      assert_received {:app_server_message, %{event: :turn_guard_failed, reason: {:codex_token_budget_exceeded, 11, 10}}}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server enforces token budget from nested codex token_count payloads" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-nested-token-budget-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-96")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-96"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-96"}}}'
+            printf '%s\\n' '{"method":"codex/event/token_count","params":{"msg":{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":250000,"output_tokens":75001,"total_tokens":325001}}}}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_max_reported_tokens: 300_000
+      )
+
+      issue = %Issue{
+        id: "issue-nested-token-budget",
+        identifier: "MT-96",
+        title: "Nested token budget",
+        description: "Ensure nested Codex token_count payloads trip the guard",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-96",
+        labels: ["backend"]
+      }
+
+      assert {:error, {:codex_token_budget_exceeded, 325_001, 300_000}} =
+               AppServer.run(workspace, "Trip nested token budget", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server fails loudly when command output delta budget is exceeded" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-output-budget-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-95")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-95"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-95"}}}'
+            printf '%s\\n' '{"method":"item/commandExecution/outputDelta","params":{"outputDelta":"abcdef"}}'
+            sleep 5
+            ;;
+          *)
+            sleep 5
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_max_command_output_delta_bytes: 5
+      )
+
+      issue = %Issue{
+        id: "issue-output-budget",
+        identifier: "MT-95",
+        title: "Output budget",
+        description: "Ensure runaway command output fails before bloating context",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-95",
+        labels: ["backend"]
+      }
+
+      assert {:error, {:codex_output_delta_budget_exceeded, 6, 5, "item/commandExecution/outputDelta"}} =
+               AppServer.run(workspace, "Trip output budget", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server captures codex side output and logs it through Logger" do
     test_root =
       Path.join(

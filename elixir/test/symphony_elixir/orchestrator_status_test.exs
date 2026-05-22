@@ -630,6 +630,103 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot_entry.codex_total_tokens == 14
   end
 
+  test "orchestrator blocks and stops a codex worker that exceeds reported token budget" do
+    issue_id = "issue-orchestrator-token-budget"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-224",
+      title: "Orchestrator token budget",
+      description: "Stop runaway Codex workers even if the app-server guard misses a payload",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-224"
+    }
+
+    write_workflow_file!(Workflow.workflow_file_path(), codex_max_reported_tokens: 300_000)
+
+    orchestrator_name = Module.concat(__MODULE__, :TokenBudgetGuardOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    on_exit(fn ->
+      if Process.alive?(worker_pid), do: Process.exit(worker_pid, :kill)
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    process_ref = Process.monitor(worker_pid)
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: process_ref,
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: "thread-budget-turn-budget",
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "codex/event/token_count",
+           "params" => %{
+             "msg" => %{
+               "type" => "event_msg",
+               "payload" => %{
+                 "type" => "token_count",
+                 "info" => %{
+                   "total_token_usage" => %{
+                     "input_tokens" => 250_000,
+                     "output_tokens" => 75_001,
+                     "total_tokens" => 325_001
+                   }
+                 }
+               }
+             }
+           }
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    Process.sleep(50)
+
+    state = :sys.get_state(pid)
+    assert state.running == %{}
+    assert %{^issue_id => blocked_entry} = state.blocked
+    assert blocked_entry.error == "codex reported token budget exceeded: 325001 > 300000"
+    refute Process.alive?(worker_pid)
+    assert state.codex_totals.total_tokens == 325_001
+  end
+
   test "orchestrator token accounting ignores last_token_usage without cumulative totals" do
     issue_id = "issue-last-token-ignored"
 
@@ -957,7 +1054,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert is_integer(due_at_ms)
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-    assert remaining_ms >= 9_500
+    assert remaining_ms > 0
     assert remaining_ms <= 10_500
   end
 

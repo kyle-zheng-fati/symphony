@@ -6,6 +6,7 @@ defmodule SymphonyElixir.StatusDashboard do
   use GenServer
   require Logger
 
+  alias SymphonyElixir.Codex.Event
   alias SymphonyElixir.{Config, HttpServer}
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixirWeb.ObservabilityPubSub
@@ -1234,12 +1235,7 @@ defmodule SymphonyElixir.StatusDashboard do
         map_path(payload, [:params, :turn, :status]) ||
         "completed"
 
-    usage =
-      map_path(payload, ["params", "usage"]) ||
-        map_path(payload, [:params, :usage]) ||
-        map_path(payload, ["params", "tokenUsage"]) ||
-        map_path(payload, [:params, :tokenUsage]) ||
-        map_value(payload, ["usage", :usage])
+    usage = Event.token_usage(payload) || map_value(payload, ["usage", :usage])
 
     usage_suffix =
       case format_usage_counts(usage) do
@@ -1292,10 +1288,7 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp humanize_codex_method("thread/tokenUsage/updated", payload) do
-    usage =
-      map_path(payload, ["params", "tokenUsage", "total"]) ||
-        map_path(payload, [:params, :tokenUsage, :total]) ||
-        map_value(payload, ["usage", :usage])
+    usage = Event.token_usage(payload) || map_value(payload, ["usage", :usage])
 
     case format_usage_counts(usage) do
       nil -> "thread token usage updated"
@@ -1507,7 +1500,7 @@ defmodule SymphonyElixir.StatusDashboard do
   defp humanize_codex_wrapper_event("mcp_tool_call_end", _payload), do: "mcp tool call completed"
 
   defp humanize_codex_wrapper_event("token_count", payload) do
-    usage = extract_first_path(payload, token_usage_paths())
+    usage = Event.token_usage(payload)
 
     case format_usage_counts(usage) do
       nil -> "token count update"
@@ -1804,17 +1797,6 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp parse_integer(_value), do: nil
-
-  defp token_usage_paths do
-    [
-      ["params", "msg", "payload", "info", "total_token_usage"],
-      [:params, :msg, :payload, :info, :total_token_usage],
-      ["params", "msg", "info", "total_token_usage"],
-      [:params, :msg, :info, :total_token_usage],
-      ["params", "tokenUsage", "total"],
-      [:params, :tokenUsage, :total]
-    ]
-  end
 
   defp delta_paths do
     [

@@ -4,7 +4,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.Codex.{DynamicTool, Event}
+  alias SymphonyElixir.{Config, PathSafety, SSH}
 
   @initialize_id 1
   @thread_start_id 2
@@ -333,15 +334,16 @@ defmodule SymphonyElixir.Codex.AppServer do
       Config.settings!().codex.turn_timeout_ms,
       "",
       tool_executor,
-      auto_approve_requests
+      auto_approve_requests,
+      %{output_delta_bytes: 0}
     )
   end
 
-  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests) do
+  defp receive_loop(port, on_message, timeout_ms, pending_line, tool_executor, auto_approve_requests, guard_state) do
     receive do
       {^port, {:data, {:eol, chunk}}} ->
         complete_line = pending_line <> to_string(chunk)
-        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests)
+        handle_incoming(port, on_message, complete_line, timeout_ms, tool_executor, auto_approve_requests, guard_state)
 
       {^port, {:data, {:noeol, chunk}}} ->
         receive_loop(
@@ -350,7 +352,8 @@ defmodule SymphonyElixir.Codex.AppServer do
           timeout_ms,
           pending_line <> to_string(chunk),
           tool_executor,
-          auto_approve_requests
+          auto_approve_requests,
+          guard_state
         )
 
       {^port, {:exit_status, status}} ->
@@ -361,7 +364,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
+  defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests, guard_state) do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
@@ -395,16 +398,30 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       {:ok, %{"method" => method} = payload}
       when is_binary(method) ->
-        handle_turn_method(
-          port,
-          on_message,
-          payload,
-          payload_string,
-          method,
-          timeout_ms,
-          tool_executor,
-          auto_approve_requests
-        )
+        case enforce_turn_guards(payload, guard_state) do
+          {:ok, guard_state} ->
+            handle_turn_method(
+              port,
+              on_message,
+              payload,
+              payload_string,
+              method,
+              timeout_ms,
+              tool_executor,
+              auto_approve_requests,
+              guard_state
+            )
+
+          {:error, reason} ->
+            emit_message(
+              on_message,
+              :turn_guard_failed,
+              %{payload: payload, raw: payload_string, reason: reason},
+              metadata_from_message(port, payload)
+            )
+
+            {:error, reason}
+        end
 
       {:ok, payload} ->
         emit_message(
@@ -417,7 +434,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata_from_message(port, payload)
         )
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, guard_state)
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -434,7 +451,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
         end
 
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, guard_state)
     end
   end
 
@@ -451,6 +468,50 @@ defmodule SymphonyElixir.Codex.AppServer do
     )
   end
 
+  defp enforce_turn_guards(payload, guard_state) when is_map(payload) do
+    with :ok <- enforce_reported_token_budget(payload),
+         {:ok, guard_state} <- enforce_output_delta_budget(payload, guard_state) do
+      {:ok, guard_state}
+    end
+  end
+
+  defp enforce_reported_token_budget(payload) do
+    max_tokens = Config.settings!().codex.max_reported_tokens || 0
+    reported_total = Event.reported_token_total(payload)
+
+    cond do
+      max_tokens <= 0 ->
+        :ok
+
+      is_integer(reported_total) and reported_total > max_tokens ->
+        {:error, {:codex_token_budget_exceeded, reported_total, max_tokens}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp enforce_output_delta_budget(payload, guard_state) do
+    max_bytes = Config.settings!().codex.max_command_output_delta_bytes || 0
+    delta = Event.command_output_delta(payload)
+
+    cond do
+      max_bytes <= 0 or is_nil(delta) ->
+        {:ok, guard_state}
+
+      true ->
+        current_bytes = Map.get(guard_state, :output_delta_bytes, 0)
+        next_bytes = current_bytes + byte_size(delta)
+
+        if next_bytes > max_bytes do
+          method = Map.get(payload, "method") || Map.get(payload, :method)
+          {:error, {:codex_output_delta_budget_exceeded, next_bytes, max_bytes, method}}
+        else
+          {:ok, Map.put(guard_state, :output_delta_bytes, next_bytes)}
+        end
+    end
+  end
+
   defp handle_turn_method(
          port,
          on_message,
@@ -459,7 +520,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          method,
          timeout_ms,
          tool_executor,
-         auto_approve_requests
+         auto_approve_requests,
+         guard_state
        ) do
     metadata = metadata_from_message(port, payload)
 
@@ -484,7 +546,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:turn_input_required, payload}}
 
       :approved ->
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, guard_state)
 
       :approval_required ->
         emit_message(
@@ -518,7 +580,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           )
 
           Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, guard_state)
         end
     end
   end
