@@ -11,6 +11,7 @@ defmodule SymphonyElixir.TestSupport do
       alias SymphonyElixir.Codex.AppServer
       alias SymphonyElixir.Config
       alias SymphonyElixir.HttpServer
+      alias SymphonyElixir.IssueRoute
       alias SymphonyElixir.Linear.Client
       alias SymphonyElixir.Linear.Issue
       alias SymphonyElixir.Orchestrator

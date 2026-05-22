@@ -105,7 +105,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+        case await_turn_completion(port, on_message, tool_executor, auto_approve_requests, workspace) do
           {:ok, result} ->
             Logger.info("Codex session completed for #{issue_context(issue)} session_id=#{session_id}")
 
@@ -407,7 +407,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
+  defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests, workspace) do
     receive_loop(
       port,
       on_message,
@@ -415,7 +415,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       "",
       tool_executor,
       auto_approve_requests,
-      %{output_delta_bytes: 0, command_events: 0, last_reported_total_tokens: nil}
+      %{workspace: workspace, output_delta_bytes: 0, command_events: 0, last_reported_total_tokens: nil}
     )
   end
 
@@ -550,6 +550,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp enforce_turn_guards(payload, guard_state) when is_map(payload) do
     with {:ok, guard_state} <- enforce_reported_token_budget(payload, guard_state),
+         {:ok, guard_state} <- enforce_command_isolation(payload, guard_state),
          {:ok, guard_state} <- enforce_output_delta_budget(payload, guard_state),
          {:ok, guard_state} <- enforce_command_event_budget(payload, guard_state) do
       {:ok, guard_state}
@@ -595,6 +596,46 @@ defmodule SymphonyElixir.Codex.AppServer do
           {:ok, Map.put(guard_state, :output_delta_bytes, next_bytes)}
         end
     end
+  end
+
+  defp enforce_command_isolation(payload, guard_state) do
+    command = Event.command(payload)
+
+    cond do
+      is_nil(command) ->
+        {:ok, guard_state}
+
+      broad_host_discovery_command?(command) ->
+        {:error, {:codex_command_isolation_violation, command, command_isolation_policy(guard_state)}}
+
+      true ->
+        {:ok, guard_state}
+    end
+  end
+
+  defp broad_host_discovery_command?(command) when is_binary(command) do
+    command = String.trim(command)
+
+    Enum.any?(
+      [
+        ~r/(^|[;&|]\s*)find\s+\/(\s|$)/,
+        ~r/(^|[;&|]\s*)find\s+\/(var\/tmp|home)(\s|\/|$)/,
+        ~r/(^|[;&|]\s*)rg\s+--files\s+\/(\s|$|var\/tmp|home)/,
+        ~r/(^|[;&|]\s*)ls\s+-R\s+\/(\s|$|var\/tmp|home)/
+      ],
+      &Regex.match?(&1, command)
+    )
+  end
+
+  defp broad_host_discovery_command?(_command), do: false
+
+  defp command_isolation_policy(guard_state) do
+    %{
+      "layer" => "command_isolation",
+      "allowed_scope" => "issue_workspace_and_explicit_prompt_paths",
+      "workspace" => Map.get(guard_state, :workspace),
+      "blocked_patterns" => ["find /", "find /var/tmp", "find /home", "rg --files /", "ls -R /"]
+    }
   end
 
   defp enforce_command_event_budget(payload, guard_state) do

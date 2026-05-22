@@ -5,13 +5,17 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, IssueBrief, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, IssueBrief, IssueRoute, Linear.Issue, PromptBuilder, Tracker, Workflow, Workspace}
 
   @outcome_relative_path Path.join([".symphony", "outcome.json"])
   @prompt_provenance_relative_path Path.join([".symphony", "prompt_provenance.json"])
+  @route_provenance_relative_path Path.join([".symphony", "route_provenance.json"])
+  @prompt_layer_provenance_relative_path Path.join([".symphony", "prompt_layer_provenance.json"])
   @internal_artifact_relative_paths [
     @outcome_relative_path,
     @prompt_provenance_relative_path,
+    @route_provenance_relative_path,
+    @prompt_layer_provenance_relative_path,
     Path.join([".symphony", "block_provenance.json"])
   ]
 
@@ -272,7 +276,10 @@ defmodule SymphonyElixir.AgentRunner do
   defp maybe_write_prompt_provenance(workspace, %Issue{} = issue, 1) when is_binary(workspace) do
     settings = Config.settings!()
     compiled_issue = IssueBrief.compile(issue, max_description_chars: settings.agent.max_issue_description_chars)
+    compiled_route = IssueRoute.compile(issue, compiled_issue: compiled_issue)
     path = Path.join(workspace, @prompt_provenance_relative_path)
+    route_path = Path.join(workspace, @route_provenance_relative_path)
+    layer_path = Path.join(workspace, @prompt_layer_provenance_relative_path)
 
     payload =
       compiled_issue.provenance
@@ -283,8 +290,21 @@ defmodule SymphonyElixir.AgentRunner do
       |> Map.put("issue_url", issue.url)
       |> Map.put("path", @prompt_provenance_relative_path)
 
+    route_payload =
+      compiled_route.provenance
+      |> Map.put("issue_identifier", issue.identifier)
+      |> Map.put("issue_id", issue.id)
+      |> Map.put("issue_title", issue.title)
+      |> Map.put("issue_state", issue.state)
+      |> Map.put("issue_url", issue.url)
+      |> Map.put("path", @route_provenance_relative_path)
+
+    layer_payload = prompt_layer_provenance_payload(issue, compiled_issue, compiled_route)
+
     with :ok <- File.mkdir_p(Path.dirname(path)),
-         :ok <- File.write(path, Jason.encode!(payload, pretty: true)) do
+         :ok <- File.write(path, Jason.encode!(payload, pretty: true)),
+         :ok <- File.write(route_path, Jason.encode!(route_payload, pretty: true)),
+         :ok <- File.write(layer_path, Jason.encode!(layer_payload, pretty: true)) do
       :ok
     else
       {:error, reason} -> {:error, {:prompt_provenance_write_failed, path, reason}}
@@ -292,6 +312,69 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp maybe_write_prompt_provenance(_workspace, _issue, _turn_number), do: :ok
+
+  defp prompt_layer_provenance_payload(%Issue{} = issue, compiled_issue, compiled_route) do
+    workflow =
+      case Workflow.current() do
+        {:ok, workflow} -> workflow
+        {:error, reason} -> %{prompt_template: "", workflow_error: inspect(reason)}
+      end
+
+    prompt_template = Map.get(workflow, :prompt_template) || Map.get(workflow, "prompt_template") || ""
+
+    %{
+      "schema" => "SymphonyPromptLayerProvenanceV1",
+      "path" => @prompt_layer_provenance_relative_path,
+      "issue_id" => issue.id,
+      "issue_identifier" => issue.identifier,
+      "composition_hierarchy" => [
+        %{"layer" => "tracker_issue", "contract" => "SymphonyIssueInputV1"},
+        %{"layer" => "issue_brief", "contract" => compiled_issue.provenance["signature"]},
+        %{"layer" => "issue_route", "contract" => compiled_route.provenance["signature"]},
+        %{"layer" => "workflow_prompt", "contract" => "Solid template"},
+        %{"layer" => "runtime_guard", "contract" => "Symphony app-server guards"}
+      ],
+      "routing_layer" => %{
+        "router" => compiled_route.provenance["compiler"],
+        "signature" => compiled_route.provenance["signature"],
+        "compiler_contract" => compiled_route.provenance["compiler_contract"],
+        "parent_signatures" => compiled_route.provenance["parent_signatures"],
+        "owner_pool" => compiled_route.route.owner_pool,
+        "eligible_pools" => compiled_route.route.eligible_pools,
+        "route_tags" => compiled_route.route.route_tags,
+        "route_reason" => compiled_route.route.route_reason,
+        "active_states" => Config.settings!().tracker.active_states,
+        "path" => @route_provenance_relative_path
+      },
+      "issue_brief_layer" => %{
+        "compiler" => compiled_issue.provenance["compiler"],
+        "compiler_contract" => compiled_issue.provenance["compiler_contract"],
+        "description_chars" => compiled_issue.provenance["description_chars"],
+        "description_included_chars" => compiled_issue.provenance["description_included_chars"],
+        "description_truncated" => compiled_issue.provenance["description_truncated"],
+        "description_sha256" => compiled_issue.provenance["description_sha256"]
+      },
+      "workflow_prompt_layer" => %{
+        "workflow_file" => Workflow.workflow_file_path(),
+        "prompt_template_sha256" => sha256(prompt_template),
+        "prompt_template_chars" => String.length(prompt_template),
+        "contains_extra_prompt_block" => String.contains?(prompt_template, "Project launch brief:")
+      },
+      "codex_home_layer" => %{
+        "auth_mode" => System.get_env("CODEX_APP_SERVER_AUTH_MODE", "source"),
+        "copy_source_agents" => System.get_env("CODEX_APP_SERVER_COPY_SOURCE_AGENTS", "0"),
+        "worker_policy" => "symphony_minimal"
+      },
+      "isolation_contract" => %{
+        "allowed_scope" => "issue_workspace_and_explicit_prompt_paths",
+        "blocked_patterns" => ["find /", "find /var/tmp", "find /home", "rg --files /", "ls -R /"]
+      }
+    }
+  end
+
+  defp sha256(value) when is_binary(value) do
+    :crypto.hash(:sha256, value) |> Base.encode16(case: :lower)
+  end
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do
     case issue_state_fetcher.([issue_id]) do

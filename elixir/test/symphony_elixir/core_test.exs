@@ -947,6 +947,7 @@ defmodule SymphonyElixir.CoreTest do
     assert Config.workflow_prompt() =~ "{{ issue.identifier }}"
     assert Config.workflow_prompt() =~ "{{ issue.title }}"
     assert Config.workflow_prompt() =~ "{{ issue.brief }}"
+    assert Config.workflow_prompt() =~ "{{ issue.route_summary }}"
     assert Config.workflow_prompt() =~ "{{ issue.context_provenance }}"
   end
 
@@ -1060,6 +1061,127 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Signature: SymphonyIssueBriefV1 (DSPy issue brief)"
     assert prompt =~ "compiler=test_dspy"
     assert prompt =~ "compiler_contract=dspy.Signature"
+  end
+
+  test "issue route fallback keeps Codex and Claude pools separate" do
+    claude_issue = %Issue{
+      id: "issue-claude",
+      identifier: "MT-CLAUDE",
+      title: "Architecture review",
+      description: "Review the mechanism and synthesize risks.",
+      state: "Todo",
+      labels: ["claude", "needs-architecture"],
+      assigned_to_worker: true
+    }
+
+    codex_issue = %Issue{
+      id: "issue-codex",
+      identifier: "MT-CODEX",
+      title: "Fix implementation bug",
+      description: "Patch and test the regression.",
+      state: "Todo",
+      labels: ["codex", "needs-implementation"],
+      assigned_to_worker: true
+    }
+
+    dual_issue = %Issue{
+      id: "issue-dual",
+      identifier: "MT-DUAL",
+      title: "Dual routed implementation review",
+      description: "Implement and review.",
+      state: "Todo",
+      labels: ["claude", "codex"],
+      assigned_to_worker: true
+    }
+
+    claude_route = IssueRoute.compile(claude_issue)
+    assert claude_route.route.owner_pool == "claude"
+    assert claude_route.route.eligible_pools == ["claude"]
+    assert claude_route.provenance["signature"] == "SymphonyIssueRouteV1"
+    assert claude_route.provenance["parent_signatures"] == ["SymphonyIssueInputV1", "SymphonyIssueBriefV1"]
+    refute IssueRoute.codex_eligible?(claude_issue)
+
+    assert IssueRoute.codex_eligible?(codex_issue)
+    assert IssueRoute.codex_eligible?(dual_issue)
+    assert IssueRoute.compile(dual_issue).route.owner_pool == "dual"
+  end
+
+  test "issue route can use configured DSPy inherited route compiler" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-dspy-route-#{System.unique_integer([:positive])}"
+      )
+
+    previous_compiler = System.get_env("SYMPHONY_ISSUE_ROUTE_COMPILER")
+    previous_runner = System.get_env("SYMPHONY_DSPY_ISSUE_ROUTE_RUNNER")
+    previous_script = System.get_env("SYMPHONY_DSPY_ISSUE_ROUTE_SCRIPT")
+
+    on_exit(fn ->
+      restore_env("SYMPHONY_ISSUE_ROUTE_COMPILER", previous_compiler)
+      restore_env("SYMPHONY_DSPY_ISSUE_ROUTE_RUNNER", previous_runner)
+      restore_env("SYMPHONY_DSPY_ISSUE_ROUTE_SCRIPT", previous_script)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(test_root)
+    dspy_script = Path.join(test_root, "fake-dspy-route.py")
+
+    File.write!(dspy_script, """
+    #!/usr/bin/env python3
+    import json
+    import sys
+
+    with open(sys.argv[1], "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    result = {
+        "route": {
+            "owner_pool": "claude",
+            "eligible_pools": ["claude"],
+            "route_tags": ["architecture_review_or_merge"],
+            "route_reason": "fake DSPy inherited route",
+            "confidence": 0.93,
+            "human_escalation": False
+        },
+        "provenance_text": "signature=SymphonyIssueRouteV1\\ncompiler=test_dspy_route\\ncompiler_contract=dspy.Signature.inherited",
+        "provenance": {
+            "signature": "SymphonyIssueRouteV1",
+            "parent_signatures": ["SymphonyIssueInputV1", "SymphonyIssueBriefV1"],
+            "compiler": "test_dspy_route",
+            "compiler_contract": "dspy.Signature.inherited",
+            "input_fields": ["identifier"],
+            "output_fields": ["owner_pool"],
+            "owner_pool": "claude",
+            "eligible_pools": ["claude"],
+            "route_tags": ["architecture_review_or_merge"],
+            "route_reason": "fake DSPy inherited route",
+            "confidence": 0.93,
+            "human_escalation": False
+        }
+    }
+    print(json.dumps(result))
+    """)
+
+    File.chmod!(dspy_script, 0o755)
+    System.put_env("SYMPHONY_ISSUE_ROUTE_COMPILER", "dspy-required")
+    System.put_env("SYMPHONY_DSPY_ISSUE_ROUTE_RUNNER", "python")
+    System.put_env("SYMPHONY_DSPY_ISSUE_ROUTE_SCRIPT", dspy_script)
+
+    issue = %Issue{
+      identifier: "MT-ROUTE",
+      title: "Use DSPy route",
+      description: "Route through the configured inherited DSPy signature.",
+      state: "Todo",
+      url: "https://example.org/issues/MT-ROUTE",
+      labels: ["codex"]
+    }
+
+    route = IssueRoute.compile(issue)
+
+    assert route.route.owner_pool == "claude"
+    assert route.route.eligible_pools == ["claude"]
+    assert route.provenance["compiler"] == "test_dspy_route"
+    assert route.provenance["compiler_contract"] == "dspy.Signature.inherited"
   end
 
   test "prompt builder reports workflow load failures separately from template parse errors" do
@@ -1227,6 +1349,32 @@ defmodule SymphonyElixir.CoreTest do
       assert {:ok, provenance} = provenance_path |> File.read!() |> Jason.decode()
       assert provenance["signature"] == "SymphonyIssueBriefV1"
       assert provenance["compiler_contract"] == "dspy-compatible-signature"
+
+      route_path = Path.join(workspace, ".symphony/route_provenance.json")
+      assert File.exists?(route_path)
+      assert {:ok, route_provenance} = route_path |> File.read!() |> Jason.decode()
+      assert route_provenance["signature"] == "SymphonyIssueRouteV1"
+      assert route_provenance["owner_pool"] == "codex"
+      assert route_provenance["eligible_pools"] == ["codex"]
+
+      layer_path = Path.join(workspace, ".symphony/prompt_layer_provenance.json")
+      assert File.exists?(layer_path)
+      assert {:ok, layer_provenance} = layer_path |> File.read!() |> Jason.decode()
+      assert layer_provenance["schema"] == "SymphonyPromptLayerProvenanceV1"
+      assert layer_provenance["routing_layer"]["owner_pool"] == "codex"
+      assert layer_provenance["routing_layer"]["eligible_pools"] == ["codex"]
+      assert layer_provenance["routing_layer"]["path"] == ".symphony/route_provenance.json"
+
+      assert Enum.map(layer_provenance["composition_hierarchy"], & &1["layer"]) == [
+               "tracker_issue",
+               "issue_brief",
+               "issue_route",
+               "workflow_prompt",
+               "runtime_guard"
+             ]
+
+      assert layer_provenance["codex_home_layer"]["copy_source_agents"] == "0"
+      assert layer_provenance["isolation_contract"]["blocked_patterns"] |> Enum.member?("find /var/tmp")
     after
       File.rm_rf(test_root)
     end

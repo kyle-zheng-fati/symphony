@@ -1631,6 +1631,83 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server blocks host-wide command discovery before it can leak shared runtime context" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-command-isolation-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-99")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-99"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-99"}}}'
+            printf '%s\\n' '{"method":"codex/event/exec_command_begin","params":{"msg":{"command":"find /var/tmp/kylezheng -name _symphony_preflight.py"}}}'
+            sleep 5
+            ;;
+          *)
+            sleep 5
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-command-isolation",
+        identifier: "MT-99",
+        title: "Command isolation",
+        description: "Ensure workers cannot search shared runtime roots",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-99",
+        labels: ["backend"]
+      }
+
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      assert {:error, {:codex_command_isolation_violation, command, policy}} =
+               AppServer.run(workspace, "Trip command isolation", issue, on_message: on_message)
+
+      assert command == "find /var/tmp/kylezheng -name _symphony_preflight.py"
+      assert policy["layer"] == "command_isolation"
+      assert canonical_tmp_path(policy["workspace"]) == canonical_tmp_path(workspace)
+
+      assert_received {:app_server_message,
+                       %{
+                         event: :turn_guard_failed,
+                         reason: {:codex_command_isolation_violation, ^command, %{"layer" => "command_isolation"}}
+                       }}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server fails loudly when command output delta budget is exceeded" do
     test_root =
       Path.join(
@@ -1972,5 +2049,11 @@ defmodule SymphonyElixir.AppServerTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  defp canonical_tmp_path(path) do
+    path
+    |> Path.expand()
+    |> String.replace_prefix("/private/var/", "/var/")
   end
 end

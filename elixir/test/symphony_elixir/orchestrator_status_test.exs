@@ -756,6 +756,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert {:ok, block_provenance} = block_provenance_path |> File.read!() |> Jason.decode()
     assert block_provenance["schema"] == "SymphonyBlockProvenanceV1"
     assert block_provenance["reason"] == "codex reported token budget exceeded: 325001 > 300000"
+    assert block_provenance["block_classification"]["layer"] == "context_budget"
+    assert block_provenance["block_classification"]["bug_class"] == "token_growth"
     assert block_provenance["codex_last_reported_total_tokens"] == 325_001
     assert block_provenance["codex_max_reported_tokens"] == 300_000
     assert block_provenance["last_codex_event"] == "notification"

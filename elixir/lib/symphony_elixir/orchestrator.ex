@@ -8,7 +8,7 @@ defmodule SymphonyElixir.Orchestrator do
   import Bitwise, only: [<<<: 2]
 
   alias SymphonyElixir.Codex.Event
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, IssueRoute, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -227,9 +227,27 @@ defmodule SymphonyElixir.Orchestrator do
     if input_required_blocker?(running_entry) do
       block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
     else
-      retry_agent_down(state, issue_id, running_entry, session_id, reason)
+      if turn_guard_blocker?(running_entry) do
+        block_turn_guard_agent_down(state, issue_id, running_entry, session_id, reason)
+      else
+        retry_agent_down(state, issue_id, running_entry, session_id, reason)
+      end
     end
   end
+
+  defp block_turn_guard_agent_down(state, issue_id, running_entry, session_id, reason) do
+    error = blocker_error(running_entry, "agent exited after Codex turn guard failed: #{inspect(reason)}")
+
+    Logger.warning("Agent task blocked by Codex turn guard for issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} session_id=#{session_id}: #{error}")
+
+    block_issue_from_entry(state, issue_id, running_entry, error)
+  end
+
+  defp turn_guard_blocker?(running_entry) when is_map(running_entry) do
+    Map.get(running_entry, :last_codex_event) == :turn_guard_failed
+  end
+
+  defp turn_guard_blocker?(_running_entry), do: false
 
   defp block_input_required_agent_down(state, issue_id, running_entry, session_id, reason) do
     error = blocker_error(running_entry, "agent exited: #{inspect(reason)}")
@@ -710,14 +728,117 @@ defmodule SymphonyElixir.Orchestrator do
   defp codex_message_blocker_error(message) do
     if codex_message_method(message) == "mcpServer/elicitation/request" do
       "codex MCP elicitation requires operator input"
+    else
+      codex_message_turn_guard_error(message)
     end
   end
+
+  defp codex_message_turn_guard_error(%{message: %{reason: reason}}), do: turn_guard_reason_text(reason)
+  defp codex_message_turn_guard_error(%{message: %{"reason" => reason}}), do: turn_guard_reason_text(reason)
+  defp codex_message_turn_guard_error(%{"reason" => reason}), do: turn_guard_reason_text(reason)
+  defp codex_message_turn_guard_error(%{reason: reason}), do: turn_guard_reason_text(reason)
+  defp codex_message_turn_guard_error(_message), do: nil
+
+  defp turn_guard_reason_text({:codex_command_isolation_violation, command, _policy}) when is_binary(command) do
+    "codex command isolation violation: #{command}"
+  end
+
+  defp turn_guard_reason_text({:codex_token_budget_exceeded, reported_total, max_tokens}),
+    do: "codex reported token budget exceeded: #{reported_total} > #{max_tokens}"
+
+  defp turn_guard_reason_text({:codex_token_delta_budget_exceeded, delta, max_delta, reported_total}),
+    do: "codex reported token jump exceeded: #{delta} > #{max_delta} (reported_total=#{reported_total})"
+
+  defp turn_guard_reason_text({:codex_output_delta_budget_exceeded, bytes, max_bytes, method}),
+    do: "codex command output budget exceeded: #{bytes} > #{max_bytes} via #{method}"
+
+  defp turn_guard_reason_text({:codex_command_event_budget_exceeded, count, max_events, command}),
+    do: "codex command event budget exceeded: #{count} > #{max_events} at #{inspect(command)}"
+
+  defp turn_guard_reason_text(_reason), do: nil
 
   defp codex_message_method(%{message: %{"method" => method}}) when is_binary(method), do: method
   defp codex_message_method(%{message: %{method: method}}) when is_binary(method), do: method
   defp codex_message_method(%{"method" => method}) when is_binary(method), do: method
   defp codex_message_method(%{method: method}) when is_binary(method), do: method
   defp codex_message_method(_message), do: nil
+
+  defp classify_block(error, running_entry) do
+    reason = codex_message_guard_reason(Map.get(running_entry, :last_codex_message))
+    recent_events = Map.get(running_entry, :codex_recent_events, [])
+    error_text = to_string(error || "")
+
+    cond do
+      command_isolation_reason?(reason) or String.contains?(error_text, "command isolation") ->
+        %{
+          "layer" => "command_isolation",
+          "bug_class" => "workflow_boundary",
+          "summary" => "Worker attempted host-wide discovery outside issue isolation.",
+          "command" => command_from_guard_reason(reason) || broad_command_from_events(recent_events)
+        }
+
+      String.contains?(error_text, "token budget") and not is_nil(broad_command_from_events(recent_events)) ->
+        %{
+          "layer" => "context_budget",
+          "bug_class" => "broad_search_context_growth",
+          "summary" => "Token budget tripped after broad command exploration.",
+          "command" => broad_command_from_events(recent_events)
+        }
+
+      String.contains?(error_text, "token budget") ->
+        %{
+          "layer" => "context_budget",
+          "bug_class" => "token_growth",
+          "summary" => "Codex reported cumulative token usage above configured guard."
+        }
+
+      true ->
+        %{
+          "layer" => "runtime",
+          "bug_class" => "unclassified",
+          "summary" => "Block did not match a known prompt, command, auth, or budget classifier."
+        }
+    end
+  end
+
+  defp codex_message_guard_reason(%{message: %{reason: reason}}), do: reason
+  defp codex_message_guard_reason(%{message: %{"reason" => reason}}), do: reason
+  defp codex_message_guard_reason(%{reason: reason}), do: reason
+  defp codex_message_guard_reason(%{"reason" => reason}), do: reason
+  defp codex_message_guard_reason(_message), do: nil
+
+  defp command_isolation_reason?({:codex_command_isolation_violation, _command, _policy}), do: true
+  defp command_isolation_reason?(_reason), do: false
+
+  defp command_from_guard_reason({:codex_command_isolation_violation, command, _policy}), do: command
+  defp command_from_guard_reason(_reason), do: nil
+
+  defp broad_command_from_events(events) when is_list(events) do
+    events
+    |> Enum.reverse()
+    |> Enum.find_value(fn
+      %{"command" => command} when is_binary(command) ->
+        if broad_command_text?(command), do: command
+
+      _ ->
+        nil
+    end)
+  end
+
+  defp broad_command_from_events(_events), do: nil
+
+  defp broad_command_text?(command) when is_binary(command) do
+    String.contains?(command, "find /") or
+      String.contains?(command, "find /var/tmp") or
+      String.contains?(command, "find /home") or
+      String.contains?(command, "rg --files /") or
+      String.contains?(command, "ls -R /")
+  end
+
+  defp broad_command_text?(_command), do: false
+
+  defp block_layer_text(%{"layer" => layer}) when is_binary(layer), do: layer
+  defp block_layer_text(_classification), do: "unclassified"
 
   defp terminate_task(pid) when is_pid(pid) do
     case Task.Supervisor.terminate_child(SymphonyElixir.TaskSupervisor, pid) do
@@ -814,7 +935,8 @@ defmodule SymphonyElixir.Orchestrator do
         codex_home: Map.get(running_entry, :codex_home),
         codex_app_server_archive_root: Map.get(running_entry, :codex_app_server_archive_root) || System.get_env("CODEX_APP_SERVER_ARCHIVE_ROOT"),
         codex_recent_events: Map.get(running_entry, :codex_recent_events, []),
-        codex_token_jumps: Map.get(running_entry, :codex_token_jumps, [])
+        codex_token_jumps: Map.get(running_entry, :codex_token_jumps, []),
+        block_classification: classify_block(error, running_entry)
       }
       |> archive_codex_home_for_block()
 
@@ -869,6 +991,7 @@ defmodule SymphonyElixir.Orchestrator do
           "workspace_path" => workspace_path,
           "blocked_at" => blocked_at_text(Map.get(blocked_entry, :blocked_at)),
           "reason" => Map.get(blocked_entry, :error),
+          "block_classification" => Map.get(blocked_entry, :block_classification),
           "last_codex_event" => codex_event_name(Map.get(blocked_entry, :last_codex_event)),
           "last_codex_timestamp" => timestamp_text(Map.get(blocked_entry, :last_codex_timestamp)),
           "codex_input_tokens" => Map.get(blocked_entry, :codex_input_tokens, 0),
@@ -914,6 +1037,7 @@ defmodule SymphonyElixir.Orchestrator do
       "- workspace_path: #{Map.get(blocked_entry, :workspace_path) || "unknown"}",
       "- blocked_at: #{blocked_at_text(Map.get(blocked_entry, :blocked_at))}",
       "- reason: #{Map.get(blocked_entry, :error) || "unknown"}",
+      "- block_layer: #{block_layer_text(Map.get(blocked_entry, :block_classification))}",
       "- last_codex_event: #{codex_event_name(event)}",
       "- last_codex_timestamp: #{timestamp_text(Map.get(blocked_entry, :last_codex_timestamp))}",
       "- codex_reported_tokens: #{Map.get(blocked_entry, :codex_last_reported_total_tokens, 0)}/#{Map.get(blocked_entry, :codex_max_reported_tokens, 0)}",
@@ -1140,23 +1264,13 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
 
-  defp issue_routable_to_worker?(%Issue{assigned_to_worker: assigned_to_worker, labels: labels})
+  defp issue_routable_to_worker?(%Issue{assigned_to_worker: assigned_to_worker} = issue)
        when is_boolean(assigned_to_worker),
-       do: assigned_to_worker and issue_label_routable_to_codex?(labels)
+       do: assigned_to_worker and IssueRoute.codex_eligible?(issue)
+
+  defp issue_routable_to_worker?(%Issue{} = issue), do: IssueRoute.codex_eligible?(issue)
 
   defp issue_routable_to_worker?(_issue), do: true
-
-  defp issue_label_routable_to_codex?(labels) when is_list(labels) do
-    normalized_labels =
-      labels
-      |> Enum.map(&to_string/1)
-      |> Enum.map(&String.downcase(String.trim(&1)))
-      |> MapSet.new()
-
-    not (MapSet.member?(normalized_labels, "claude") and not MapSet.member?(normalized_labels, "codex"))
-  end
-
-  defp issue_label_routable_to_codex?(_labels), do: true
 
   defp todo_issue_blocked_by_non_terminal?(
          %Issue{state: issue_state, blocked_by: blockers},

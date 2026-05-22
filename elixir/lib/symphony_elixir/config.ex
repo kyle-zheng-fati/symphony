@@ -15,6 +15,9 @@ defmodule SymphonyElixir.Config do
   Compiled issue brief:
   {{ issue.brief }}
 
+  Route:
+  {{ issue.route_summary }}
+
   Prompt provenance:
   {{ issue.context_provenance }}
   """

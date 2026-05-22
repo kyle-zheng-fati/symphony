@@ -3,7 +3,7 @@ defmodule SymphonyElixir.PromptBuilder do
   Builds agent prompts from Linear issue data.
   """
 
-  alias SymphonyElixir.{Config, IssueBrief, Workflow}
+  alias SymphonyElixir.{Config, IssueBrief, IssueRoute, Workflow}
 
   @render_opts [strict_variables: true, strict_filters: true]
 
@@ -18,6 +18,8 @@ defmodule SymphonyElixir.PromptBuilder do
 
     settings = Config.settings!()
     compiled_issue = IssueBrief.compile(issue, max_description_chars: settings.agent.max_issue_description_chars)
+    compiled_route = IssueRoute.compile(issue, compiled_issue: compiled_issue)
+    context_provenance = Enum.join([compiled_issue.provenance_text, compiled_route.provenance_text], "\n")
 
     template
     |> Solid.render!(
@@ -28,7 +30,10 @@ defmodule SymphonyElixir.PromptBuilder do
           |> Map.from_struct()
           |> Map.merge(%{
             brief: compiled_issue.brief,
-            context_provenance: compiled_issue.provenance_text,
+            route: compiled_route.route,
+            route_summary: render_route_summary(compiled_route.route),
+            context_provenance: context_provenance,
+            route_provenance: compiled_route.provenance_text,
             prompt_provenance: compiled_issue.provenance
           })
           |> to_solid_map()
@@ -66,6 +71,15 @@ defmodule SymphonyElixir.PromptBuilder do
   defp to_solid_value(value) when is_map(value), do: to_solid_map(value)
   defp to_solid_value(value) when is_list(value), do: Enum.map(value, &to_solid_value/1)
   defp to_solid_value(value), do: value
+
+  defp render_route_summary(%{owner_pool: owner_pool, eligible_pools: eligible_pools, route_reason: route_reason}) do
+    [
+      "- owner_pool: #{owner_pool}",
+      "- eligible_pools: #{Enum.join(eligible_pools, ",")}",
+      "- reason: #{route_reason}"
+    ]
+    |> Enum.join("\n")
+  end
 
   defp default_prompt(prompt) when is_binary(prompt) do
     if String.trim(prompt) == "" do
