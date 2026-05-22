@@ -97,13 +97,13 @@ defmodule SymphonyElixir.TestSupport do
           tracker_api_token: "token",
           tracker_project_slug: "project",
           tracker_assignee: nil,
-          tracker_active_states: ["Todo", "In Progress"],
+          tracker_active_states: ["Todo", "In Progress", "Merging", "Rework"],
           tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
           poll_interval_ms: 30_000,
           workspace_root: Path.join(System.tmp_dir!(), "symphony_workspaces"),
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
-          max_concurrent_agents: 10,
+          max_concurrent_agents: 5,
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
           max_issue_description_chars: 6_000,
@@ -116,7 +116,9 @@ defmodule SymphonyElixir.TestSupport do
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
           codex_max_reported_tokens: 0,
+          codex_max_reported_token_delta: 0,
           codex_max_command_output_delta_bytes: 0,
+          codex_max_command_events: 0,
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
@@ -156,7 +158,9 @@ defmodule SymphonyElixir.TestSupport do
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
     codex_max_reported_tokens = Keyword.get(config, :codex_max_reported_tokens)
+    codex_max_reported_token_delta = Keyword.get(config, :codex_max_reported_token_delta)
     codex_max_command_output_delta_bytes = Keyword.get(config, :codex_max_command_output_delta_bytes)
+    codex_max_command_events = Keyword.get(config, :codex_max_command_events)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
@@ -200,7 +204,9 @@ defmodule SymphonyElixir.TestSupport do
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
         "  max_reported_tokens: #{yaml_value(codex_max_reported_tokens)}",
+        "  max_reported_token_delta: #{yaml_value(codex_max_reported_token_delta)}",
         "  max_command_output_delta_bytes: #{yaml_value(codex_max_command_output_delta_bytes)}",
+        "  max_command_events: #{yaml_value(codex_max_command_events)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),

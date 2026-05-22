@@ -22,6 +22,7 @@ defmodule SymphonyElixir.IssueBrief do
     "evidence_pointers",
     "description_excerpt"
   ]
+  @dspy_script Path.expand("../../../../scripts/symphony-dspy-issue-brief.py", __DIR__)
 
   @type compiled :: %{
           brief: String.t(),
@@ -39,6 +40,25 @@ defmodule SymphonyElixir.IssueBrief do
       |> Keyword.get(:max_description_chars, @default_max_description_chars)
       |> normalize_max_chars()
 
+    case issue_brief_compiler() do
+      :dspy ->
+        case compile_with_dspy(issue, max_chars) do
+          {:ok, compiled} -> compiled
+          {:error, reason} -> compile_elixir(issue, max_chars, reason)
+        end
+
+      :dspy_required ->
+        case compile_with_dspy(issue, max_chars) do
+          {:ok, compiled} -> compiled
+          {:error, reason} -> raise RuntimeError, "dspy_issue_brief_failed: #{inspect(reason)}"
+        end
+
+      :elixir ->
+        compile_elixir(issue, max_chars)
+    end
+  end
+
+  defp compile_elixir(%Issue{} = issue, max_chars, fallback_reason \\ nil) do
     raw_description = normalize_text(issue.description)
     description_excerpt = bounded_excerpt(raw_description, max_chars)
     description_truncated = String.length(raw_description) > String.length(description_excerpt)
@@ -46,26 +66,135 @@ defmodule SymphonyElixir.IssueBrief do
     requirements = extract_signal_lines(description_excerpt, @max_signal_lines)
     acceptance_criteria = extract_acceptance_lines(description_excerpt, @max_acceptance_lines)
 
-    provenance = %{
-      "signature" => @signature_version,
-      "compiler" => "symphony_elixir.issue_brief",
-      "compiler_contract" => "dspy-compatible-signature",
-      "input_fields" => @input_fields,
-      "output_fields" => @output_fields,
-      "description_sha256" => sha256(raw_description),
-      "description_chars" => String.length(raw_description),
-      "description_bytes" => byte_size(raw_description),
-      "description_included_chars" => String.length(description_excerpt),
-      "description_included_bytes" => byte_size(description_excerpt),
-      "description_truncated" => description_truncated,
-      "max_issue_description_chars" => max_chars
-    }
+    provenance =
+      %{
+        "signature" => @signature_version,
+        "compiler" => "symphony_elixir.issue_brief",
+        "compiler_contract" => "dspy-compatible-signature",
+        "input_fields" => @input_fields,
+        "output_fields" => @output_fields,
+        "description_sha256" => sha256(raw_description),
+        "description_chars" => String.length(raw_description),
+        "description_bytes" => byte_size(raw_description),
+        "description_included_chars" => String.length(description_excerpt),
+        "description_included_bytes" => byte_size(description_excerpt),
+        "description_truncated" => description_truncated,
+        "max_issue_description_chars" => max_chars
+      }
+      |> maybe_put_fallback_reason(fallback_reason)
 
     %{
       brief: render_brief(issue, requirements, acceptance_criteria, description_excerpt, provenance),
       provenance_text: render_provenance(provenance),
       provenance: provenance
     }
+  end
+
+  defp issue_brief_compiler do
+    case System.get_env("SYMPHONY_ISSUE_BRIEF_COMPILER", "elixir") |> String.trim() |> String.downcase() do
+      "dspy" -> :dspy
+      "dspy-required" -> :dspy_required
+      "dspy_required" -> :dspy_required
+      _ -> :elixir
+    end
+  end
+
+  defp compile_with_dspy(%Issue{} = issue, max_chars) do
+    with {:ok, executable, args} <- dspy_command(),
+         {:ok, input} <- dspy_input(issue, max_chars),
+         {:ok, input_path} <- write_dspy_input(input),
+         {output, 0} <- run_dspy_command(executable, args, input_path),
+         {:ok, payload} <- Jason.decode(output),
+         {:ok, compiled} <- normalize_dspy_compiled(payload) do
+      {:ok, compiled}
+    else
+      {output, status} when is_integer(status) ->
+        {:error, {:dspy_exit, status, String.slice(to_string(output), 0, 1_000)}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  rescue
+    error in [ErlangError, RuntimeError] ->
+      {:error, {:dspy_exception, Exception.message(error)}}
+  end
+
+  defp write_dspy_input(input) when is_binary(input) do
+    path =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-dspy-issue-brief-#{System.unique_integer([:positive])}.json"
+      )
+
+    case File.write(path, input) do
+      :ok -> {:ok, path}
+      {:error, reason} -> {:error, {:dspy_input_write_failed, path, reason}}
+    end
+  end
+
+  defp run_dspy_command(executable, args, input_path) do
+    try do
+      System.cmd(executable, args ++ [input_path])
+    after
+      File.rm(input_path)
+    end
+  end
+
+  defp dspy_command do
+    script = System.get_env("SYMPHONY_DSPY_ISSUE_BRIEF_SCRIPT", @dspy_script)
+
+    if File.regular?(script) do
+      case System.get_env("SYMPHONY_DSPY_ISSUE_BRIEF_RUNNER", "uv") |> String.trim() |> String.downcase() do
+        "python" ->
+          case System.find_executable("python3") || System.find_executable("python") do
+            nil -> {:error, :python_not_found}
+            executable -> {:ok, executable, [script]}
+          end
+
+        _ ->
+          case System.find_executable("uv") do
+            nil -> {:error, :uv_not_found}
+            executable -> {:ok, executable, ["run", "--script", script]}
+          end
+      end
+    else
+      {:error, {:dspy_script_missing, script}}
+    end
+  end
+
+  defp dspy_input(%Issue{} = issue, max_chars) do
+    Jason.encode(%{
+      "max_description_chars" => max_chars,
+      "issue" => %{
+        "id" => issue.id,
+        "identifier" => issue.identifier,
+        "title" => issue.title,
+        "description" => issue.description,
+        "state" => issue.state,
+        "url" => issue.url,
+        "labels" => issue.labels
+      }
+    })
+  end
+
+  defp normalize_dspy_compiled(%{
+         "brief" => brief,
+         "provenance_text" => provenance_text,
+         "provenance" => provenance
+       })
+       when is_binary(brief) and is_binary(provenance_text) and is_map(provenance) do
+    {:ok, %{brief: brief, provenance_text: provenance_text, provenance: provenance}}
+  end
+
+  defp normalize_dspy_compiled(payload), do: {:error, {:invalid_dspy_payload, payload}}
+
+  defp maybe_put_fallback_reason(provenance, nil), do: provenance
+
+  defp maybe_put_fallback_reason(provenance, reason) do
+    Map.merge(provenance, %{
+      "preferred_compiler" => "dspy",
+      "compiler_fallback_reason" => inspect(reason, limit: 5)
+    })
   end
 
   defp normalize_max_chars(value) when is_integer(value) and value >= 0, do: value
@@ -194,6 +323,9 @@ defmodule SymphonyElixir.IssueBrief do
       "signature=#{provenance["signature"]}",
       "compiler=#{provenance["compiler"]}",
       "compiler_contract=#{provenance["compiler_contract"]}",
+      optional_provenance_line("preferred_compiler", provenance),
+      optional_provenance_line("compiler_fallback_reason", provenance),
+      optional_provenance_line("dspy_version", provenance),
       "input_fields=#{Enum.join(provenance["input_fields"], ",")}",
       "output_fields=#{Enum.join(provenance["output_fields"], ",")}",
       "description_sha256=#{provenance["description_sha256"]}",
@@ -204,7 +336,15 @@ defmodule SymphonyElixir.IssueBrief do
       "description_truncated=#{provenance["description_truncated"]}",
       "max_issue_description_chars=#{provenance["max_issue_description_chars"]}"
     ]
+    |> Enum.reject(&is_nil/1)
     |> Enum.join("\n")
+  end
+
+  defp optional_provenance_line(key, provenance) do
+    case Map.get(provenance, key) do
+      nil -> nil
+      value -> "#{key}=#{value}"
+    end
   end
 
   defp safe_text(nil, fallback), do: fallback

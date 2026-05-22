@@ -26,6 +26,7 @@ defmodule SymphonyElixir.StatusDashboard do
   @running_event_min_width 12
   @running_row_chrome_width 10
   @default_terminal_columns 115
+  @default_claude_max_concurrent_sessions 5
 
   @ansi_reset IO.ANSI.reset()
   @ansi_bold IO.ANSI.bright()
@@ -317,6 +318,7 @@ defmodule SymphonyElixir.StatusDashboard do
              running: running,
              retrying: retrying,
              codex_totals: codex_totals,
+             agent_pools: Map.get(snapshot, :agent_pools) || agent_pools(running),
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)
            }},
@@ -341,8 +343,10 @@ defmodule SymphonyElixir.StatusDashboard do
         codex_output_tokens = Map.get(codex_totals, :output_tokens, 0)
         codex_total_tokens = Map.get(codex_totals, :total_tokens, 0)
         codex_seconds_running = Map.get(codex_totals, :seconds_running, 0)
-        agent_count = length(running)
-        max_agents = Config.settings!().agent.max_concurrent_agents
+        agent_pools = normalize_agent_pools(Map.get(snapshot, :agent_pools), running)
+        total_pool = Map.fetch!(agent_pools, :total)
+        codex_pool = Map.fetch!(agent_pools, :codex)
+        claude_pool = Map.fetch!(agent_pools, :claude)
         running_event_width = running_event_width(terminal_columns_override)
         running_rows = format_running_rows(running, running_event_width)
         running_to_backoff_spacer = if(running == [], do: [], else: ["│"])
@@ -350,10 +354,13 @@ defmodule SymphonyElixir.StatusDashboard do
 
         ([
            colorize("╭─ SYMPHONY STATUS", @ansi_bold),
-           colorize("│ Agents: ", @ansi_bold) <>
-             colorize("#{agent_count}", @ansi_green) <>
+           format_tele_status_line(),
+           colorize("│ Agents Total: ", @ansi_bold) <>
+             colorize("#{pool_value(total_pool, :active)}", @ansi_green) <>
              colorize("/", @ansi_gray) <>
-             colorize("#{max_agents}", @ansi_gray),
+             colorize("#{pool_value(total_pool, :max)}", @ansi_gray),
+           format_agent_pool_line("Codex", codex_pool, "Symphony dispatcher"),
+           format_agent_pool_line("Claude Code", claude_pool, "sidecar supervisor"),
            colorize("│ Throughput: ", @ansi_bold) <> colorize("#{format_tps(tps)} tps", @ansi_cyan),
            colorize("│ Runtime: ", @ansi_bold) <>
              colorize(format_runtime_seconds(codex_seconds_running), @ansi_magenta),
@@ -366,13 +373,15 @@ defmodule SymphonyElixir.StatusDashboard do
            colorize("│ Rate Limits: ", @ansi_bold) <> format_rate_limits(rate_limits),
            project_link_lines,
            project_refresh_line,
-           colorize("├─ Running", @ansi_bold),
+           colorize("├─ Codex running", @ansi_bold),
            "│",
            running_table_header_row(running_event_width),
            running_table_separator_row(running_event_width)
          ] ++
            running_rows ++
            running_to_backoff_spacer ++
+           [colorize("├─ Claude Code sidecars", @ansi_bold), "│"] ++
+           format_claude_rows(claude_pool) ++
            [colorize("├─ Backoff queue", @ansi_bold), "│"] ++
            backoff_rows ++
            [closing_border()])
@@ -427,6 +436,204 @@ defmodule SymphonyElixir.StatusDashboard do
   defp format_project_refresh_line(_) do
     colorize("│ Next refresh: ", @ansi_bold) <> colorize("n/a", @ansi_gray)
   end
+
+  defp format_tele_status_line do
+    objective =
+      System.get_env("SYMPHONY_TELE_OBJECTIVE") ||
+        "make the AA harness beat the same base model without the harness on AIME and Deepsearch"
+
+    evidence = System.get_env("SYMPHONY_TELE_EVIDENCE") || ""
+
+    case System.get_env("SYMPHONY_TELE_STATUS", "not_achieved") |> String.downcase() |> String.trim() do
+      status when status in ["achieved", "complete", "done", "won"] ->
+        suffix = if evidence == "", do: "", else: " — #{evidence}"
+
+        colorize("│ TELE ACHIEVED: ", @ansi_bold <> @ansi_green) <>
+          colorize(truncate(objective <> suffix, 104), @ansi_green)
+
+      _ ->
+        suffix = if evidence == "", do: "", else: " — #{evidence}"
+
+        colorize("│ Tele: ", @ansi_bold) <>
+          colorize("not achieved", @ansi_yellow) <>
+          colorize(" — #{truncate(objective <> suffix, 98)}", @ansi_gray)
+    end
+  end
+
+  defp format_agent_pool_line(label, pool, note) do
+    colorize("│ #{label}: ", @ansi_bold) <>
+      colorize("#{pool_value(pool, :active)}", @ansi_green) <>
+      colorize("/", @ansi_gray) <>
+      colorize("#{pool_value(pool, :max)}", @ansi_gray) <>
+      colorize(" #{note}", @ansi_dim)
+  end
+
+  defp agent_pools(running) when is_list(running) do
+    %{
+      codex: %{
+        active: length(running),
+        max: Config.settings!().agent.max_concurrent_agents,
+        sessions: []
+      },
+      claude: claude_pool()
+    }
+    |> put_total_pool()
+  end
+
+  defp normalize_agent_pools(nil, running), do: agent_pools(running)
+
+  defp normalize_agent_pools(agent_pools, running) when is_map(agent_pools) do
+    codex =
+      agent_pools
+      |> pool_for(:codex)
+      |> normalize_agent_pool(length(running), Config.settings!().agent.max_concurrent_agents)
+
+    claude =
+      agent_pools
+      |> pool_for(:claude)
+      |> normalize_agent_pool(0, 0)
+
+    %{codex: codex, claude: claude}
+    |> put_total_pool()
+  end
+
+  defp normalize_agent_pools(_agent_pools, running), do: agent_pools(running)
+
+  defp pool_for(agent_pools, key) when is_map(agent_pools) and is_atom(key) do
+    Map.get(agent_pools, key) || Map.get(agent_pools, Atom.to_string(key)) || %{}
+  end
+
+  defp normalize_agent_pool(pool, default_active, default_max) when is_map(pool) do
+    %{
+      active: normalized_nonnegative_integer(pool_value(pool, :active), default_active),
+      max: normalized_nonnegative_integer(pool_value(pool, :max), default_max),
+      sessions: pool_value(pool, :sessions, [])
+    }
+  end
+
+  defp normalize_agent_pool(_pool, default_active, default_max) do
+    %{active: default_active, max: default_max, sessions: []}
+  end
+
+  defp put_total_pool(%{codex: codex, claude: claude} = pools) do
+    Map.put(pools, :total, %{
+      active: pool_value(codex, :active) + pool_value(claude, :active),
+      max: pool_value(codex, :max) + pool_value(claude, :max),
+      sessions: []
+    })
+  end
+
+  defp claude_pool do
+    sessions =
+      claude_sidecar_state_file()
+      |> read_claude_sidecar_sessions()
+
+    %{
+      active: length(sessions),
+      max: claude_max_concurrent_sessions(),
+      sessions: sessions
+    }
+  end
+
+  defp claude_sidecar_state_file do
+    System.get_env("CLAUDE_SIDECAR_STATE_FILE") ||
+      Path.join(["runs", "claude-sidecar-runs.json"])
+  end
+
+  defp read_claude_sidecar_sessions(path) when is_binary(path) do
+    with {:ok, raw} <- File.read(path),
+         {:ok, %{"issues" => issues}} when is_map(issues) <- Jason.decode(raw) do
+      issues
+      |> Map.values()
+      |> Enum.filter(&(Map.get(&1, "status") == "running"))
+      |> Enum.map(&claude_session_summary/1)
+      |> Enum.sort_by(&Map.get(&1, :identifier, ""))
+    else
+      _ -> []
+    end
+  end
+
+  defp read_claude_sidecar_sessions(_path), do: []
+
+  defp claude_session_summary(record) when is_map(record) do
+    %{
+      identifier: Map.get(record, "identifier") || "unknown",
+      state: Map.get(record, "linear_state") || "running",
+      session: Map.get(record, "tmux_session") || Map.get(record, "claude_bg_id") || "n/a",
+      mode: Map.get(record, "mode") || "claude"
+    }
+  end
+
+  defp claude_session_summary(_record) do
+    %{identifier: "unknown", state: "running", session: "n/a", mode: "claude"}
+  end
+
+  defp claude_max_concurrent_sessions do
+    System.get_env("CLAUDE_MAX_CONCURRENT_SESSIONS")
+    |> parse_positive_integer(@default_claude_max_concurrent_sessions)
+  end
+
+  defp format_claude_rows(claude_pool) do
+    sessions = pool_value(claude_pool, :sessions, [])
+    active = pool_value(claude_pool, :active)
+
+    cond do
+      sessions != [] ->
+        Enum.map(sessions, &format_claude_row/1)
+
+      active > 0 ->
+        ["│  " <> colorize("#{active} active Claude Code sidecar(s); ledger details unavailable", @ansi_yellow), "│"]
+
+      true ->
+        ["│  " <> colorize("No active Claude Code sidecars", @ansi_gray), "│"]
+    end
+  end
+
+  defp format_claude_row(session) when is_map(session) do
+    identifier = session |> pool_value(:identifier, "unknown") |> to_string() |> format_cell(@running_id_width)
+    state = session |> pool_value(:state, "running") |> to_string() |> format_cell(@running_stage_width)
+    name = session |> pool_value(:session, "n/a") |> to_string() |> compact_session_id() |> format_cell(@running_session_width)
+    mode = session |> pool_value(:mode, "claude") |> to_string()
+
+    "│ " <>
+      status_dot(@ansi_magenta) <>
+      " " <>
+      colorize(identifier, @ansi_cyan) <>
+      " " <>
+      colorize(state, @ansi_magenta) <>
+      " " <>
+      colorize(name, @ansi_cyan) <>
+      " " <>
+      colorize(mode, @ansi_magenta)
+  end
+
+  defp pool_value(pool, key, default \\ 0)
+
+  defp pool_value(pool, key, default) when is_map(pool) and is_atom(key) do
+    Map.get(pool, key) || Map.get(pool, Atom.to_string(key)) || default
+  end
+
+  defp pool_value(_pool, _key, default), do: default
+
+  defp normalized_nonnegative_integer(value, _default) when is_integer(value) and value >= 0, do: value
+
+  defp normalized_nonnegative_integer(value, default) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {integer, ""} when integer >= 0 -> integer
+      _ -> default
+    end
+  end
+
+  defp normalized_nonnegative_integer(_value, default), do: default
+
+  defp parse_positive_integer(value, default) when is_binary(value) do
+    case Integer.parse(String.trim(value)) do
+      {integer, ""} when integer > 0 -> integer
+      _ -> default
+    end
+  end
+
+  defp parse_positive_integer(_value, default), do: default
 
   defp linear_project_url(project_slug), do: "https://linear.app/project/#{project_slug}/issues"
 
@@ -548,31 +755,39 @@ defmodule SymphonyElixir.StatusDashboard do
   def dashboard_url_for_test(host, configured_port, bound_port),
     do: dashboard_url(host, configured_port, bound_port)
 
+  @doc false
+  @spec snapshot_payload_for_test(map()) :: {:ok, map()} | :error
+  def snapshot_payload_for_test(snapshot), do: normalize_snapshot_payload(snapshot)
+
   defp snapshot_payload do
     if Process.whereis(Orchestrator) do
-      case Orchestrator.snapshot() do
-        %{
-          running: running,
-          retrying: retrying,
-          codex_totals: codex_totals
-        } = snapshot
-        when is_list(running) and is_list(retrying) ->
-          {:ok,
-           %{
-             running: running,
-             retrying: retrying,
-             codex_totals: codex_totals,
-             rate_limits: Map.get(snapshot, :rate_limits),
-             polling: Map.get(snapshot, :polling)
-           }}
-
-        _ ->
-          :error
-      end
+      Orchestrator.snapshot()
+      |> normalize_snapshot_payload()
     else
       :error
     end
   end
+
+  defp normalize_snapshot_payload(
+         %{
+           running: running,
+           retrying: retrying,
+           codex_totals: codex_totals
+         } = snapshot
+       )
+       when is_list(running) and is_list(retrying) do
+    {:ok,
+     %{
+       running: running,
+       retrying: retrying,
+       codex_totals: codex_totals,
+       agent_pools: Map.get(snapshot, :agent_pools) || agent_pools(running),
+       rate_limits: Map.get(snapshot, :rate_limits),
+       polling: Map.get(snapshot, :polling)
+     }}
+  end
+
+  defp normalize_snapshot_payload(_snapshot), do: :error
 
   defp format_running_rows(running, running_event_width) do
     if running == [] do
@@ -1147,6 +1362,7 @@ defmodule SymphonyElixir.StatusDashboard do
     do: humanize_dynamic_tool_event("unsupported dynamic tool call rejected", payload)
 
   defp humanize_codex_event(:turn_ended_with_error, message, _payload), do: "turn ended with error: #{format_reason(message)}"
+  defp humanize_codex_event(:codex_error, message, _payload), do: "codex error: #{format_reason(message)}"
   defp humanize_codex_event(:startup_failed, message, _payload), do: "startup failed: #{format_reason(message)}"
   defp humanize_codex_event(:turn_failed, _message, payload), do: humanize_codex_method("turn/failed", payload)
   defp humanize_codex_event(:turn_cancelled, _message, _payload), do: "turn cancelled"
@@ -1255,6 +1471,18 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp humanize_codex_method("turn/cancelled", _payload), do: "turn cancelled"
+
+  defp humanize_codex_method("error", payload) do
+    reason =
+      map_path(payload, ["params", "message"]) ||
+        map_path(payload, [:params, :message]) ||
+        map_path(payload, ["params", "error", "message"]) ||
+        map_path(payload, [:params, :error, :message]) ||
+        map_path(payload, ["error", "message"]) ||
+        map_path(payload, [:error, :message])
+
+    if is_binary(reason), do: "codex error: #{inline_text(reason)}", else: "codex error"
+  end
 
   defp humanize_codex_method("turn/diff/updated", payload) do
     diff =

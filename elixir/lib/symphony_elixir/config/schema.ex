@@ -50,7 +50,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:api_key, :string)
       field(:project_slug, :string)
       field(:assignee, :string)
-      field(:active_states, {:array, :string}, default: ["Todo", "In Progress"])
+      field(:active_states, {:array, :string}, default: ["Todo", "In Progress", "Merging", "Rework"])
       field(:terminal_states, {:array, :string}, default: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"])
     end
 
@@ -128,7 +128,7 @@ defmodule SymphonyElixir.Config.Schema do
 
     @primary_key false
     embedded_schema do
-      field(:max_concurrent_agents, :integer, default: 10)
+      field(:max_concurrent_agents, :integer, default: 5)
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_issue_description_chars, :integer, default: 6_000)
@@ -183,7 +183,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
       field(:max_reported_tokens, :integer, default: 0)
+      field(:max_reported_token_delta, :integer, default: 0)
       field(:max_command_output_delta_bytes, :integer, default: 0)
+      field(:max_command_events, :integer, default: 0)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -200,7 +202,9 @@ defmodule SymphonyElixir.Config.Schema do
           :read_timeout_ms,
           :stall_timeout_ms,
           :max_reported_tokens,
-          :max_command_output_delta_bytes
+          :max_reported_token_delta,
+          :max_command_output_delta_bytes,
+          :max_command_events
         ],
         empty_values: []
       )
@@ -209,7 +213,9 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
       |> validate_number(:max_reported_tokens, greater_than_or_equal_to: 0)
+      |> validate_number(:max_reported_token_delta, greater_than_or_equal_to: 0)
       |> validate_number(:max_command_output_delta_bytes, greater_than_or_equal_to: 0)
+      |> validate_number(:max_command_events, greater_than_or_equal_to: 0)
     end
   end
 

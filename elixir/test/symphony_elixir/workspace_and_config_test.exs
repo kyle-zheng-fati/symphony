@@ -767,7 +767,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       codex_read_timeout_ms: nil,
       codex_stall_timeout_ms: nil,
       codex_max_reported_tokens: nil,
+      codex_max_reported_token_delta: nil,
       codex_max_command_output_delta_bytes: nil,
+      codex_max_command_events: nil,
       tracker_api_token: nil,
       tracker_project_slug: nil
     )
@@ -778,7 +780,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.tracker.project_slug == nil
     assert config.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
     assert config.worker.max_concurrent_agents_per_host == nil
-    assert config.agent.max_concurrent_agents == 10
+    assert config.agent.max_concurrent_agents == 5
     assert config.codex.command == "codex app-server"
 
     assert config.codex.approval_policy == %{
@@ -807,7 +809,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.read_timeout_ms == 5_000
     assert config.codex.stall_timeout_ms == 300_000
     assert config.codex.max_reported_tokens == 0
+    assert config.codex.max_reported_token_delta == 0
     assert config.codex.max_command_output_delta_bytes == 0
+    assert config.codex.max_command_events == 0
 
     write_workflow_file!(Workflow.workflow_file_path(),
       codex_command: "codex --config 'model=\"gpt-5.5\"' app-server"
@@ -875,9 +879,17 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.max_reported_tokens"
 
+    write_workflow_file!(Workflow.workflow_file_path(), codex_max_reported_token_delta: "bad")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.max_reported_token_delta"
+
     write_workflow_file!(Workflow.workflow_file_path(), codex_max_command_output_delta_bytes: "bad")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.max_command_output_delta_bytes"
+
+    write_workflow_file!(Workflow.workflow_file_path(), codex_max_command_events: "bad")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.max_command_events"
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_active_states: %{todo: true},
@@ -885,7 +897,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       poll_interval_ms: %{bad: true},
       workspace_root: 123,
       max_retry_backoff_ms: 0,
-      max_concurrent_agents_by_state: %{"Todo" => "1", "Review" => 0, "Done" => "bad"},
+      max_concurrent_agents_by_state: %{"Todo" => "1", "Invalid" => 0, "Done" => "bad"},
       hook_timeout_ms: 0,
       observability_enabled: "maybe",
       observability_refresh_ms: %{bad: true},
@@ -997,7 +1009,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       max_concurrent_agents_by_state:
         todo: 1
         "In Progress": 4
-        "In Review": 2
+        Rework: 2
     ---
     """
 
@@ -1006,7 +1018,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Config.settings!().agent.max_concurrent_agents == 10
     assert Config.max_concurrent_agents_for_state("Todo") == 1
     assert Config.max_concurrent_agents_for_state("In Progress") == 4
-    assert Config.max_concurrent_agents_for_state("In Review") == 2
+    assert Config.max_concurrent_agents_for_state("Rework") == 2
     assert Config.max_concurrent_agents_for_state("Closed") == 10
     assert Config.max_concurrent_agents_for_state(:not_a_string) == 10
 

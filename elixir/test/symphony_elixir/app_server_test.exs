@@ -262,6 +262,167 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server treats Codex error notifications as hard failures with payload evidence" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-error-notification-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-ERROR")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-error"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-error"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"error","params":{"message":"model candidate rejected","code":"model_not_found"}}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-error-notification",
+        identifier: "MT-ERROR",
+        title: "Preserve Codex error notification",
+        description: "Ensure Codex app-server error notifications are provenance-visible hard failures",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-ERROR",
+        labels: ["backend"]
+      }
+
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      log =
+        capture_log(fn ->
+          assert {:error, {:codex_error, %{"code" => "model_not_found", "message" => "model candidate rejected"}}} =
+                   AppServer.run(workspace, "Trigger Codex error", issue, on_message: on_message)
+        end)
+
+      assert_received {:app_server_message,
+                       %{
+                         event: :codex_error,
+                         reason: %{"code" => "model_not_found", "message" => "model candidate rejected"},
+                         payload: %{"method" => "error", "params" => %{"code" => "model_not_found"}}
+                       }}
+
+      assert log =~ "Codex error notification"
+      assert log =~ "model candidate rejected"
+      refute_received {:app_server_message, %{event: :turn_completed}}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server ignores retryable Codex reconnect errors until turn completion" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-retryable-error-notification-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-RETRY")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-retry"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-retry"}}}'
+            printf '%s\\n' '{"method":"error","params":{"message":"Reconnecting... 2/5","willRetry":true,"error":{"additionalDetails":"stream disconnected before completion: websocket closed by server before response.completed","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":null}}}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-retry-error-notification",
+        identifier: "MT-RETRY",
+        title: "Ignore retryable reconnect notification",
+        description: "Ensure Codex app-server reconnect notices do not kill live turns",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-RETRY",
+        labels: ["backend"]
+      }
+
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      log =
+        capture_log(fn ->
+          assert {:ok, %{result: :turn_completed}} =
+                   AppServer.run(workspace, "Survive reconnect", issue, on_message: on_message)
+        end)
+
+      assert_received {:app_server_message,
+                       %{
+                         event: :notification,
+                         payload: %{"method" => "error", "params" => %{"willRetry" => true}}
+                       }}
+
+      assert_received {:app_server_message, %{event: :turn_completed}}
+      refute_received {:app_server_message, %{event: :codex_error}}
+      assert log =~ "Codex retryable error notification"
+      refute log =~ "Codex session ended with error"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server treats MCP elicitation requests as hard input blockers" do
     test_root =
       Path.join(
@@ -491,20 +652,24 @@ defmodule SymphonyElixir.AppServerTest do
                    |> String.trim_leading("JSON:")
                    |> Jason.decode!()
 
-                 payload["id"] == 2 and
-                   case get_in(payload, ["params", "dynamicTools"]) do
-                     [
-                       %{
-                         "description" => description,
-                         "inputSchema" => %{"required" => ["query"]},
-                         "name" => "linear_graphql"
-                       }
-                     ] ->
-                       description =~ "Linear"
+                 if payload["id"] == 2 do
+                   tools = get_in(payload, ["params", "dynamicTools"]) || []
+                   linear_tool = Enum.find(tools, &(&1["name"] == "linear_graphql"))
+                   townhall_tool = Enum.find(tools, &(&1["name"] == "townhall_post"))
 
-                     _ ->
-                       false
-                   end
+                   match?(
+                     %{"description" => description, "inputSchema" => %{"required" => ["query"]}}
+                     when is_binary(description),
+                     linear_tool
+                   ) and linear_tool["description"] =~ "Linear" and
+                     match?(
+                       %{"description" => description, "inputSchema" => %{"required" => ["claim", "next"]}}
+                       when is_binary(description),
+                       townhall_tool
+                     ) and townhall_tool["description"] =~ "Discord"
+                 else
+                   false
+                 end
                else
                  false
                end
@@ -1326,6 +1491,138 @@ defmodule SymphonyElixir.AppServerTest do
 
       assert {:error, {:codex_token_budget_exceeded, 325_001, 300_000}} =
                AppServer.run(workspace, "Trip nested token budget", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server fails early when reported token delta budget is exceeded" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-token-delta-budget-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-97")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-97"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-97"}}}'
+            printf '%s\\n' '{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"total":{"input_tokens":100,"output_tokens":1,"total_tokens":101}}}}'
+            printf '%s\\n' '{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"total":{"input_tokens":275,"output_tokens":2,"total_tokens":277}}}}'
+            sleep 5
+            ;;
+          *)
+            sleep 5
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_max_reported_token_delta: 150
+      )
+
+      issue = %Issue{
+        id: "issue-token-delta-budget",
+        identifier: "MT-97",
+        title: "Token delta budget",
+        description: "Ensure sudden cumulative context jumps fail early",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-97",
+        labels: ["backend"]
+      }
+
+      assert {:error, {:codex_token_delta_budget_exceeded, 176, 150, 277}} =
+               AppServer.run(workspace, "Trip token delta budget", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server fails early when command exploration budget is exceeded" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-command-budget-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-98")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-98"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-98"}}}'
+            printf '%s\\n' '{"method":"codex/event/exec_command_begin","params":{"msg":{"command":"git status --short"}}}'
+            printf '%s\\n' '{"method":"codex/event/exec_command_begin","params":{"msg":{"command":"find . -type f"}}}'
+            sleep 5
+            ;;
+          *)
+            sleep 5
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_max_command_events: 1
+      )
+
+      issue = %Issue{
+        id: "issue-command-budget",
+        identifier: "MT-98",
+        title: "Command event budget",
+        description: "Ensure broad exploration is bounded before context grows",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-98",
+        labels: ["backend"]
+      }
+
+      assert {:error, {:codex_command_event_budget_exceeded, 2, 1, "find . -type f"}} =
+               AppServer.run(workspace, "Trip command budget", issue)
     after
       File.rm_rf(test_root)
     end

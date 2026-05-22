@@ -28,16 +28,48 @@ defmodule SymphonyElixir.Codex.Event do
 
   @command_output_delta_methods [
     "item/commandExecution/outputDelta",
-    "item/fileChange/outputDelta"
+    "item/fileChange/outputDelta",
+    "codex/event/exec_command_output_delta"
   ]
 
   @command_output_delta_paths [
+    ["params", "delta"],
     ["params", "outputDelta"],
+    ["params", "msg", "delta"],
     ["params", "msg", "outputDelta"],
+    ["params", "msg", "payload", "delta"],
     ["params", "msg", "payload", "outputDelta"],
+    [:params, :delta],
     [:params, :outputDelta],
+    [:params, :msg, :delta],
     [:params, :msg, :outputDelta],
+    [:params, :msg, :payload, :delta],
     [:params, :msg, :payload, :outputDelta]
+  ]
+
+  @command_event_methods [
+    "codex/event/exec_command_begin",
+    "item/commandExecution/requestApproval",
+    "execCommandApproval"
+  ]
+
+  @command_paths [
+    ["params", "msg", "command"],
+    [:params, :msg, :command],
+    ["params", "msg", "parsed_cmd"],
+    [:params, :msg, :parsed_cmd],
+    ["params", "msg", "parsedCmd"],
+    [:params, :msg, :parsedCmd],
+    ["params", "command"],
+    [:params, :command],
+    ["params", "cmd"],
+    [:params, :cmd],
+    ["params", "parsedCmd"],
+    [:params, :parsedCmd],
+    ["params", "argv"],
+    [:params, :argv],
+    ["params", "args"],
+    [:params, :args]
   ]
 
   @spec token_usage(map()) :: map() | nil
@@ -53,12 +85,14 @@ defmodule SymphonyElixir.Codex.Event do
 
   @spec token_usage_from_update(map()) :: map()
   def token_usage_from_update(update) when is_map(update) do
+    payload = update[:payload] || Map.get(update, "payload") || Map.get(update, :payload)
+
     payloads = [
       update[:usage],
       Map.get(update, "usage"),
       Map.get(update, :usage),
-      update[:payload],
-      Map.get(update, "payload"),
+      payload,
+      wrapped_payload(payload),
       update
     ]
 
@@ -88,7 +122,7 @@ defmodule SymphonyElixir.Codex.Event do
 
   @spec command_output_delta(map()) :: binary() | nil
   def command_output_delta(payload) when is_map(payload) do
-    method = Map.get(payload, "method") || Map.get(payload, :method)
+    method = method(payload)
 
     if method in @command_output_delta_methods do
       Enum.find_value(@command_output_delta_paths, &binary_at_path(payload, &1))
@@ -96,6 +130,31 @@ defmodule SymphonyElixir.Codex.Event do
   end
 
   def command_output_delta(_payload), do: nil
+
+  @spec command_event?(map()) :: boolean()
+  def command_event?(payload) when is_map(payload), do: method(payload) in @command_event_methods
+  def command_event?(_payload), do: false
+
+  @spec method(map()) :: String.t() | nil
+  def method(payload) when is_map(payload) do
+    case Map.get(payload, "method") || Map.get(payload, :method) do
+      method when is_binary(method) -> method
+      _ -> payload |> wrapped_payload() |> method_from_wrapped()
+    end
+  end
+
+  def method(_payload), do: nil
+
+  @spec command(map()) :: String.t() | nil
+  def command(payload) when is_map(payload) do
+    Enum.find_value(@command_paths, fn path ->
+      payload
+      |> value_at_path(path)
+      |> normalize_command()
+    end)
+  end
+
+  def command(_payload), do: nil
 
   defp usage_from_value(value) when is_map(value) do
     if integer_token_map?(value), do: value
@@ -155,6 +214,43 @@ defmodule SymphonyElixir.Codex.Event do
     end
   end
 
+  defp wrapped_payload(%{"payload" => payload}) when is_map(payload), do: payload
+  defp wrapped_payload(%{payload: payload}) when is_map(payload), do: payload
+  defp wrapped_payload(_payload), do: nil
+
+  defp method_from_wrapped(payload) when is_map(payload), do: method(payload)
+  defp method_from_wrapped(_payload), do: nil
+
+  defp normalize_command(%{} = command) do
+    binary_command = Map.get(command, "parsedCmd") || Map.get(command, :parsedCmd) || Map.get(command, "command") || Map.get(command, :command) || Map.get(command, "cmd") || Map.get(command, :cmd)
+    args = Map.get(command, "args") || Map.get(command, :args) || Map.get(command, "argv") || Map.get(command, :argv)
+
+    if is_binary(binary_command) and is_list(args) do
+      normalize_command([binary_command | args])
+    else
+      normalize_command(binary_command || args)
+    end
+  end
+
+  defp normalize_command(command) when is_binary(command) do
+    command
+    |> String.replace("\n", " ")
+    |> String.replace(~r/\s+/, " ")
+    |> String.trim()
+    |> truncate(160)
+    |> empty_to_nil()
+  end
+
+  defp normalize_command(command) when is_list(command) do
+    if Enum.all?(command, &is_binary/1) do
+      command
+      |> Enum.join(" ")
+      |> normalize_command()
+    end
+  end
+
+  defp normalize_command(_command), do: nil
+
   defp value_at_path(payload, path) do
     Enum.reduce_while(path, payload, fn key, acc ->
       cond do
@@ -180,4 +276,10 @@ defmodule SymphonyElixir.Codex.Event do
   end
 
   defp integer_like(_value), do: nil
+
+  defp truncate(text, max_bytes) when byte_size(text) <= max_bytes, do: text
+  defp truncate(text, max_bytes), do: binary_part(text, 0, max_bytes) <> "..."
+
+  defp empty_to_nil(""), do: nil
+  defp empty_to_nil(value), do: value
 end

@@ -4,22 +4,39 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
   alias SymphonyElixir.Codex.DynamicTool
 
   test "tool_specs advertises the linear_graphql input contract" do
-    assert [
-             %{
-               "description" => description,
-               "inputSchema" => %{
-                 "properties" => %{
-                   "query" => _,
-                   "variables" => _
-                 },
-                 "required" => ["query"],
-                 "type" => "object"
+    specs = DynamicTool.tool_specs()
+
+    assert %{
+             "description" => description,
+             "inputSchema" => %{
+               "properties" => %{
+                 "query" => _,
+                 "variables" => _
                },
-               "name" => "linear_graphql"
-             }
-           ] = DynamicTool.tool_specs()
+               "required" => ["query"],
+               "type" => "object"
+             },
+             "name" => "linear_graphql"
+           } = Enum.find(specs, &(&1["name"] == "linear_graphql"))
 
     assert description =~ "Linear"
+
+    assert %{
+             "description" => townhall_description,
+             "inputSchema" => %{
+               "properties" => %{
+                 "claim" => _,
+                 "next" => _,
+                 "transport" => _
+               },
+               "required" => ["claim", "next"],
+               "type" => "object"
+             },
+             "name" => "townhall_post"
+           } = Enum.find(specs, &(&1["name"] == "townhall_post"))
+
+    assert townhall_description =~ "Discord"
+    assert townhall_description =~ "OPENAI_API_KEY"
   end
 
   test "unsupported tools return a failure payload with the supported tool list" do
@@ -30,7 +47,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert Jason.decode!(response["output"]) == %{
              "error" => %{
                "message" => ~s(Unsupported dynamic tool: "not_a_real_tool".),
-               "supportedTools" => ["linear_graphql"]
+               "supportedTools" => ["linear_graphql", "townhall_post"]
              }
            }
 
@@ -63,6 +80,59 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
     assert response["success"] == true
     assert Jason.decode!(response["output"]) == %{"data" => %{"viewer" => %{"id" => "usr_123"}}}
     assert response["contentItems"] == [%{"type" => "inputText", "text" => response["output"]}]
+  end
+
+  test "townhall_post posts normalized blocker payloads" do
+    test_pid = self()
+
+    response =
+      DynamicTool.execute(
+        "townhall_post",
+        %{
+          "claim" => "RAG blocked by missing OPENAI_API_KEY",
+          "evidence" => "pytest tests/test_page_rag.py -q",
+          "next" => "source ~/.env or refresh key",
+          "status" => "needs-human"
+        },
+        townhall_runner: fn payload ->
+          send(test_pid, {:townhall_payload, payload})
+          {:ok, %{"event" => %{"id" => "th_test"}, "dispatch" => [%{"transport" => "discord", "ok" => true}]}}
+        end
+      )
+
+    assert_received {:townhall_payload,
+                     %{
+                       "claim" => "RAG blocked by missing OPENAI_API_KEY",
+                       "evidence" => "pytest tests/test_page_rag.py -q",
+                       "level" => "state",
+                       "next" => "source ~/.env or refresh key",
+                       "owner" => "codex",
+                       "status" => "needs-human",
+                       "transport" => "local,discord"
+                     } = payload}
+
+    assert is_binary(payload["workspace"])
+    assert response["success"] == true
+    assert Jason.decode!(response["output"])["event"]["id"] == "th_test"
+  end
+
+  test "townhall_post validates required fields before posting" do
+    response =
+      DynamicTool.execute(
+        "townhall_post",
+        %{"claim" => "missing next"},
+        townhall_runner: fn _payload ->
+          flunk("townhall runner should not be called when arguments are invalid")
+        end
+      )
+
+    assert response["success"] == false
+
+    assert Jason.decode!(response["output"]) == %{
+             "error" => %{
+               "message" => "`townhall_post` requires a non-empty `next` string."
+             }
+           }
   end
 
   test "linear_graphql accepts a raw GraphQL query string" do

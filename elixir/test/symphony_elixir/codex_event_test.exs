@@ -63,4 +63,34 @@ defmodule SymphonyElixir.CodexEventTest do
              "params" => %{"delta" => "not guarded"}
            }) == nil
   end
+
+  test "normalizes wrapped guard payloads and command events" do
+    update = %{
+      event: :turn_guard_failed,
+      payload: %{
+        payload: %{
+          "method" => "thread/tokenUsage/updated",
+          "params" => %{
+            "tokenUsage" => %{
+              "total" => %{"input_tokens" => 316_266, "output_tokens" => 1_401, "total_tokens" => 317_667}
+            }
+          }
+        },
+        reason: {:codex_token_budget_exceeded, 317_667, 300_000}
+      }
+    }
+
+    usage = Event.token_usage_from_update(update)
+    assert Event.input_tokens(usage) == 316_266
+    assert Event.output_tokens(usage) == 1_401
+    assert Event.total_tokens(usage) == 317_667
+
+    command_payload = %{
+      "method" => "codex/event/exec_command_begin",
+      "params" => %{"msg" => %{"command" => "find . -type f"}}
+    }
+
+    assert Event.command_event?(command_payload)
+    assert Event.command(command_payload) == "find . -type f"
+  end
 end

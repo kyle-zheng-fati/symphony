@@ -749,7 +749,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert block_comment =~ "thread-budget-turn-budget"
     assert block_comment =~ "codex_reported_tokens: 325001/300000"
     assert block_comment =~ ".symphony/block_provenance.json"
-    assert_receive {:memory_tracker_state_update, ^issue_id, "Human Review"}, 500
+    assert_receive {:memory_tracker_state_update, ^issue_id, "Rework"}, 500
 
     block_provenance_path = Path.join(workspace_path, ".symphony/block_provenance.json")
     assert File.exists?(block_provenance_path)
@@ -758,6 +758,13 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert block_provenance["reason"] == "codex reported token budget exceeded: 325001 > 300000"
     assert block_provenance["codex_last_reported_total_tokens"] == 325_001
     assert block_provenance["codex_max_reported_tokens"] == 300_000
+    assert block_provenance["last_codex_event"] == "notification"
+
+    assert [%{"method" => "codex/event/token_count", "reported_total" => 325_001}] =
+             block_provenance["recent_codex_events"]
+
+    assert [%{"total_delta" => 325_001, "reported_total" => 325_001}] =
+             block_provenance["token_jumps"]
   end
 
   test "orchestrator token accounting ignores last_token_usage without cumulative totals" do
@@ -1320,6 +1327,45 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert rendered =~ "http://127.0.0.1:4000/"
   end
 
+  test "status dashboard preserves orchestrator-reported agent pool capacity" do
+    snapshot =
+      %{
+        running: [
+          %{
+            identifier: "MT-POOL",
+            state: "running",
+            session_id: "thread-1234567890",
+            codex_app_server_pid: "4242",
+            codex_total_tokens: 0,
+            runtime_seconds: 10,
+            turn_count: 1,
+            last_codex_event: "codex/event/task_started",
+            last_codex_message: %{}
+          }
+        ],
+        retrying: [],
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 10},
+        agent_pools: %{
+          codex: %{active: 1, max: 5},
+          claude: %{active: 0, max: 5}
+        },
+        rate_limits: nil
+      }
+
+    assert {:ok, %{agent_pools: %{codex: %{active: 1, max: 5}, claude: %{active: 0, max: 5}}}} =
+             StatusDashboard.snapshot_payload_for_test(snapshot)
+
+    rendered =
+      snapshot
+      |> StatusDashboard.snapshot_payload_for_test()
+      |> StatusDashboard.format_snapshot_content_for_test(0.0)
+      |> then(&Regex.replace(~r/\e\[[0-9;]*m/, &1, ""))
+
+    assert rendered =~ "Agents Total: 1/10"
+    assert rendered =~ "Codex: 1/5"
+    assert rendered =~ "Claude Code: 0/5"
+  end
+
   test "status dashboard prefers the bound server port and normalizes wildcard hosts" do
     assert StatusDashboard.dashboard_url_for_test("0.0.0.0", 0, 43_123) ==
              "http://127.0.0.1:43123/"
@@ -1370,7 +1416,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
     plain = Regex.replace(~r/\e\[[0-9;]*m/, rendered, "")
 
-    assert plain =~ ~r/No active agents\r?\n│\s*\r?\n├─ Backoff queue/
+    assert plain =~ ~r/No active agents.*No active Claude Code sidecars.*├─ Backoff queue/s
   end
 
   test "status dashboard adds a spacer line before backoff queue when agents are active" do
@@ -1664,6 +1710,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     event_cases = [
       {"turn/started", %{"params" => %{"turn" => %{"id" => "turn-1"}}}, "turn started"},
       {"turn/completed", %{"params" => %{"turn" => %{"status" => "completed"}}}, "turn completed"},
+      {"error", %{"params" => %{"message" => "model candidate rejected"}}, "codex error: model candidate rejected"},
       {"turn/diff/updated", %{"params" => %{"diff" => "line1\nline2"}}, "turn diff updated"},
       {"turn/plan/updated", %{"params" => %{"plan" => [%{"step" => "a"}, %{"step" => "b"}]}}, "plan updated"},
       {"thread/tokenUsage/updated",

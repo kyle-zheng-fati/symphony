@@ -42,8 +42,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     worker_host = Keyword.get(opts, :worker_host)
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-         {:ok, port} <- start_port(expanded_workspace, worker_host) do
-      metadata = port_metadata(port, worker_host)
+         {:ok, port, launch_metadata} <- start_port(expanded_workspace, worker_host) do
+      metadata = Map.merge(port_metadata(port, worker_host), launch_metadata)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
            {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
@@ -193,6 +193,8 @@ defmodule SymphonyElixir.Codex.AppServer do
     if is_nil(executable) do
       {:error, :bash_not_found}
     else
+      {command, launch_metadata} = local_launch_command(workspace)
+
       port =
         Port.open(
           {:spawn_executable, String.to_charlist(executable)},
@@ -200,27 +202,105 @@ defmodule SymphonyElixir.Codex.AppServer do
             :binary,
             :exit_status,
             :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(Config.settings!().codex.command)],
+            args: [~c"-lc", String.to_charlist(command)],
             cd: String.to_charlist(workspace),
             line: @port_line_bytes
           ]
         )
 
-      {:ok, port}
+      {:ok, port, launch_metadata}
     end
   end
 
   defp start_port(workspace, worker_host) when is_binary(worker_host) do
-    remote_command = remote_launch_command(workspace)
-    SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
+    {remote_command, launch_metadata} = remote_launch_command(workspace)
+
+    case SSH.start_port(worker_host, remote_command, line: @port_line_bytes) do
+      {:ok, port} -> {:ok, port, launch_metadata}
+      other -> other
+    end
+  end
+
+  defp local_launch_command(workspace) when is_binary(workspace) do
+    {env_prefix, launch_metadata} = managed_launch_env(workspace)
+    command = [env_prefix, Config.settings!().codex.command] |> Enum.reject(&(&1 == "")) |> Enum.join(" ")
+    {command, launch_metadata}
   end
 
   defp remote_launch_command(workspace) when is_binary(workspace) do
+    {env_prefix, launch_metadata} = managed_launch_env(workspace)
+    command = [env_prefix, "exec", Config.settings!().codex.command] |> Enum.reject(&(&1 == "")) |> Enum.join(" ")
+
     [
       "cd #{shell_escape(workspace)}",
-      "exec #{Config.settings!().codex.command}"
+      command
     ]
     |> Enum.join(" && ")
+    |> then(&{&1, launch_metadata})
+  end
+
+  defp managed_launch_env(workspace) do
+    issue_identifier = workspace |> Path.basename() |> safe_env_component()
+
+    base_env = %{
+      "SYMPHONY_WORKSPACE" => workspace,
+      "SYMPHONY_ISSUE_ID" => issue_identifier,
+      "SYMPHONY_AGENT_ID" => issue_identifier
+    }
+
+    {env, metadata} =
+      if managed_codex_home?() do
+        codex_home = managed_codex_home(issue_identifier)
+        archive_root = System.get_env("CODEX_APP_SERVER_ARCHIVE_ROOT")
+
+        {
+          Map.merge(base_env, %{
+            "CODEX_HOME" => codex_home,
+            "CODEX_APP_SERVER_MANAGED_HOME" => "1"
+          }),
+          %{
+            codex_home: codex_home,
+            codex_app_server_archive_root: archive_root
+          }
+        }
+      else
+        {base_env, %{}}
+      end
+
+    env_prefix =
+      env
+      |> Enum.map(fn {key, value} -> "#{key}=#{shell_escape(value)}" end)
+      |> Enum.join(" ")
+
+    {env_prefix, metadata}
+  end
+
+  defp managed_codex_home? do
+    Config.settings!().codex.command
+    |> to_string()
+    |> String.contains?("codex-app-server-isolated.sh")
+  end
+
+  defp managed_codex_home(issue_identifier) do
+    root =
+      System.get_env("CODEX_APP_SERVER_HOME_ROOT") ||
+        Path.join(System.tmp_dir!(), "codex-app-servers")
+
+    nonce = System.unique_integer([:positive])
+    stamp = DateTime.utc_now() |> Calendar.strftime("%Y%m%dT%H%M%SZ")
+    host = System.get_env("HOSTNAME") || "host"
+
+    Path.join(root, "#{safe_env_component(host)}-#{issue_identifier}-#{stamp}-#{nonce}")
+  end
+
+  defp safe_env_component(value) when is_binary(value) do
+    value
+    |> String.replace(~r/[^A-Za-z0-9_.-]/, "-")
+    |> String.trim("-")
+    |> case do
+      "" -> "app"
+      safe -> safe
+    end
   end
 
   defp port_metadata(port, worker_host) when is_port(port) do
@@ -335,7 +415,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       "",
       tool_executor,
       auto_approve_requests,
-      %{output_delta_bytes: 0}
+      %{output_delta_bytes: 0, command_events: 0, last_reported_total_tokens: nil}
     )
   end
 
@@ -469,25 +549,30 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp enforce_turn_guards(payload, guard_state) when is_map(payload) do
-    with :ok <- enforce_reported_token_budget(payload),
-         {:ok, guard_state} <- enforce_output_delta_budget(payload, guard_state) do
+    with {:ok, guard_state} <- enforce_reported_token_budget(payload, guard_state),
+         {:ok, guard_state} <- enforce_output_delta_budget(payload, guard_state),
+         {:ok, guard_state} <- enforce_command_event_budget(payload, guard_state) do
       {:ok, guard_state}
     end
   end
 
-  defp enforce_reported_token_budget(payload) do
-    max_tokens = Config.settings!().codex.max_reported_tokens || 0
+  defp enforce_reported_token_budget(payload, guard_state) do
+    codex_config = Config.settings!().codex
+    max_tokens = codex_config.max_reported_tokens || 0
+    max_delta = codex_config.max_reported_token_delta || 0
     reported_total = Event.reported_token_total(payload)
+    previous_total = Map.get(guard_state, :last_reported_total_tokens)
+    reported_delta = reported_token_delta(reported_total, previous_total)
 
     cond do
-      max_tokens <= 0 ->
-        :ok
-
-      is_integer(reported_total) and reported_total > max_tokens ->
+      max_tokens > 0 and is_integer(reported_total) and reported_total > max_tokens ->
         {:error, {:codex_token_budget_exceeded, reported_total, max_tokens}}
 
+      max_delta > 0 and is_integer(reported_delta) and reported_delta > max_delta ->
+        {:error, {:codex_token_delta_budget_exceeded, reported_delta, max_delta, reported_total}}
+
       true ->
-        :ok
+        {:ok, maybe_put_reported_total(guard_state, reported_total)}
     end
   end
 
@@ -511,6 +596,38 @@ defmodule SymphonyElixir.Codex.AppServer do
         end
     end
   end
+
+  defp enforce_command_event_budget(payload, guard_state) do
+    max_events = Config.settings!().codex.max_command_events || 0
+
+    cond do
+      max_events <= 0 or not Event.command_event?(payload) ->
+        {:ok, guard_state}
+
+      true ->
+        next_count = Map.get(guard_state, :command_events, 0) + 1
+
+        if next_count > max_events do
+          {:error, {:codex_command_event_budget_exceeded, next_count, max_events, Event.command(payload)}}
+        else
+          {:ok, Map.put(guard_state, :command_events, next_count)}
+        end
+    end
+  end
+
+  defp reported_token_delta(reported_total, previous_total)
+       when is_integer(reported_total) and is_integer(previous_total) do
+    max(reported_total - previous_total, 0)
+  end
+
+  defp reported_token_delta(reported_total, nil) when is_integer(reported_total), do: reported_total
+  defp reported_token_delta(_reported_total, _previous_total), do: nil
+
+  defp maybe_put_reported_total(guard_state, reported_total) when is_integer(reported_total) do
+    Map.put(guard_state, :last_reported_total_tokens, reported_total)
+  end
+
+  defp maybe_put_reported_total(guard_state, _reported_total), do: guard_state
 
   defp handle_turn_method(
          port,
@@ -559,31 +676,74 @@ defmodule SymphonyElixir.Codex.AppServer do
         {:error, {:approval_required, payload}}
 
       :unhandled ->
-        if needs_input?(method, payload) do
-          emit_message(
-            on_message,
-            :turn_input_required,
-            %{payload: payload, raw: payload_string},
-            metadata
-          )
+        cond do
+          retryable_codex_error_notification?(payload) ->
+            emit_message(
+              on_message,
+              :notification,
+              %{
+                payload: payload,
+                raw: payload_string
+              },
+              metadata
+            )
 
-          {:error, {:turn_input_required, payload}}
-        else
-          emit_message(
-            on_message,
-            :notification,
-            %{
-              payload: payload,
-              raw: payload_string
-            },
-            metadata
-          )
+            Logger.warning("Codex retryable error notification: #{summarize_protocol_payload(payload)}")
+            receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, guard_state)
 
-          Logger.debug("Codex notification: #{inspect(method)}")
-          receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, guard_state)
+          codex_error_notification?(method) ->
+            reason = Map.get(payload, "params") || payload
+
+            emit_message(
+              on_message,
+              :codex_error,
+              %{payload: payload, raw: payload_string, reason: reason},
+              metadata
+            )
+
+            Logger.warning("Codex error notification: #{summarize_protocol_payload(payload)}")
+            {:error, {:codex_error, reason}}
+
+          needs_input?(method, payload) ->
+            emit_message(
+              on_message,
+              :turn_input_required,
+              %{payload: payload, raw: payload_string},
+              metadata
+            )
+
+            {:error, {:turn_input_required, payload}}
+
+          true ->
+            emit_message(
+              on_message,
+              :notification,
+              %{
+                payload: payload,
+                raw: payload_string
+              },
+              metadata
+            )
+
+            Logger.debug("Codex notification: #{inspect(method)}")
+            receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests, guard_state)
         end
     end
   end
+
+  defp codex_error_notification?("error"), do: true
+  defp codex_error_notification?(_method), do: false
+
+  defp retryable_codex_error_notification?(%{"method" => "error", "params" => params})
+       when is_map(params) do
+    retryable_value?(Map.get(params, "willRetry"))
+  end
+
+  defp retryable_codex_error_notification?(_payload), do: false
+
+  defp retryable_value?(true), do: true
+  defp retryable_value?("true"), do: true
+  defp retryable_value?(_value), do: false
 
   defp maybe_handle_approval_request(
          port,
@@ -1039,6 +1199,13 @@ defmodule SymphonyElixir.Codex.AppServer do
         Logger.debug("Codex #{stream_label} output: #{text}")
       end
     end
+  end
+
+  defp summarize_protocol_payload(payload) do
+    payload
+    |> inspect(limit: 30, printable_limit: @max_stream_log_bytes)
+    |> String.replace("\n", " ")
+    |> String.slice(0, @max_stream_log_bytes)
   end
 
   defp protocol_message_candidate?(data) do

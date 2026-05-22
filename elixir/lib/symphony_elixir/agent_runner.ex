@@ -205,17 +205,17 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp outcome_status(_payload), do: {:error, :missing_status}
 
-  defp outcome_target_states(status, _workspace) when status in ["needs_merge", "merge", "merging"], do: {:ok, ["Merging", "In Review"]}
+  defp outcome_target_states(status, _workspace) when status in ["needs_merge", "merge", "merging"], do: {:ok, ["Merging"]}
 
   defp outcome_target_states(status, _workspace) when status in ["needs_review", "human_review", "review", "blocked", "needs_human"],
-    do: {:ok, ["Human Review", "In Review"]}
+    do: {:ok, ["Rework"]}
 
   defp outcome_target_states(status, _workspace) when status in ["continue", "in_progress"], do: :no_outcome
 
   defp outcome_target_states("done", workspace) do
     if git_dirty?(workspace) do
       Logger.warning("Outcome status=done but workspace is dirty; routing to Merging instead of Done workspace=#{workspace}")
-      {:ok, ["Merging", "In Review"]}
+      {:ok, ["Merging"]}
     else
       {:ok, ["Done"]}
     end

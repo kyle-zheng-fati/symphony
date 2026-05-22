@@ -744,8 +744,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp stop_and_block_issue(%State{} = state, issue_id, running_entry, error) do
+    state = block_issue_from_entry(state, issue_id, running_entry, error)
     stop_running_task(Map.get(running_entry, :pid), Map.get(running_entry, :ref))
-    block_issue_from_entry(state, issue_id, running_entry, error)
+    state
   end
 
   defp stop_codex_issue_if_token_budget_exceeded(%State{} = state, issue_id, running_entry)
@@ -753,45 +754,69 @@ defmodule SymphonyElixir.Orchestrator do
     max_tokens = Config.settings!().codex.max_reported_tokens || 0
     reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
 
-    if max_tokens > 0 and is_integer(reported_total) and reported_total > max_tokens do
-      identifier = Map.get(running_entry, :identifier, issue_id)
-      session_id = running_entry_session_id(running_entry)
-      error = "codex reported token budget exceeded: #{reported_total} > #{max_tokens}"
+    max_delta = Config.settings!().codex.max_reported_token_delta || 0
+    reported_delta = Map.get(running_entry, :codex_last_token_delta_total, 0)
 
-      Logger.error("Issue blocked: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id}; #{error}")
+    cond do
+      max_tokens > 0 and is_integer(reported_total) and reported_total > max_tokens ->
+        identifier = Map.get(running_entry, :identifier, issue_id)
+        session_id = running_entry_session_id(running_entry)
+        error = "codex reported token budget exceeded: #{reported_total} > #{max_tokens}"
 
-      state
-      |> record_session_completion_totals(running_entry)
-      |> stop_and_block_issue(issue_id, running_entry, error)
-    else
-      state
+        Logger.error("Issue blocked: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id}; #{error}")
+
+        state
+        |> record_session_completion_totals(running_entry)
+        |> stop_and_block_issue(issue_id, running_entry, error)
+
+      max_delta > 0 and is_integer(reported_delta) and reported_delta > max_delta ->
+        identifier = Map.get(running_entry, :identifier, issue_id)
+        session_id = running_entry_session_id(running_entry)
+        error = "codex reported token jump exceeded: #{reported_delta} > #{max_delta}"
+
+        Logger.error("Issue blocked: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id}; #{error}")
+
+        state
+        |> record_session_completion_totals(running_entry)
+        |> stop_and_block_issue(issue_id, running_entry, error)
+
+      true ->
+        state
     end
   end
 
   defp stop_codex_issue_if_token_budget_exceeded(state, _issue_id, _running_entry), do: state
 
   defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error) do
-    blocked_entry = %{
-      issue_id: issue_id,
-      identifier: Map.get(running_entry, :identifier, issue_id),
-      issue: Map.get(running_entry, :issue),
-      worker_host: Map.get(running_entry, :worker_host),
-      workspace_path: Map.get(running_entry, :workspace_path),
-      session_id: running_entry_session_id(running_entry),
-      error: error,
-      blocked_at: DateTime.utc_now(),
-      last_codex_message: Map.get(running_entry, :last_codex_message),
-      last_codex_event: Map.get(running_entry, :last_codex_event),
-      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
-      codex_input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
-      codex_output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
-      codex_total_tokens: Map.get(running_entry, :codex_total_tokens, 0),
-      codex_last_reported_input_tokens: Map.get(running_entry, :codex_last_reported_input_tokens, 0),
-      codex_last_reported_output_tokens: Map.get(running_entry, :codex_last_reported_output_tokens, 0),
-      codex_last_reported_total_tokens: Map.get(running_entry, :codex_last_reported_total_tokens, 0),
-      codex_max_reported_tokens: Config.settings!().codex.max_reported_tokens || 0,
-      codex_max_command_output_delta_bytes: Config.settings!().codex.max_command_output_delta_bytes || 0
-    }
+    blocked_entry =
+      %{
+        issue_id: issue_id,
+        identifier: Map.get(running_entry, :identifier, issue_id),
+        issue: Map.get(running_entry, :issue),
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path),
+        session_id: running_entry_session_id(running_entry),
+        error: error,
+        blocked_at: DateTime.utc_now(),
+        last_codex_message: Map.get(running_entry, :last_codex_message),
+        last_codex_event: Map.get(running_entry, :last_codex_event),
+        last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
+        codex_input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
+        codex_output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
+        codex_total_tokens: Map.get(running_entry, :codex_total_tokens, 0),
+        codex_last_reported_input_tokens: Map.get(running_entry, :codex_last_reported_input_tokens, 0),
+        codex_last_reported_output_tokens: Map.get(running_entry, :codex_last_reported_output_tokens, 0),
+        codex_last_reported_total_tokens: Map.get(running_entry, :codex_last_reported_total_tokens, 0),
+        codex_max_reported_tokens: Config.settings!().codex.max_reported_tokens || 0,
+        codex_max_reported_token_delta: Config.settings!().codex.max_reported_token_delta || 0,
+        codex_max_command_output_delta_bytes: Config.settings!().codex.max_command_output_delta_bytes || 0,
+        codex_max_command_events: Config.settings!().codex.max_command_events || 0,
+        codex_home: Map.get(running_entry, :codex_home),
+        codex_app_server_archive_root: Map.get(running_entry, :codex_app_server_archive_root) || System.get_env("CODEX_APP_SERVER_ARCHIVE_ROOT"),
+        codex_recent_events: Map.get(running_entry, :codex_recent_events, []),
+        codex_token_jumps: Map.get(running_entry, :codex_token_jumps, [])
+      }
+      |> archive_codex_home_for_block()
 
     write_block_provenance(blocked_entry)
 
@@ -819,7 +844,7 @@ defmodule SymphonyElixir.Orchestrator do
           Logger.warning("Failed to write block provenance for issue_id=#{issue_id}: #{inspect(reason)}")
       end
 
-      case update_issue_state_candidates(issue_id, ["Human Review", "In Review"]) do
+      case update_issue_state_candidates(issue_id, ["Rework"]) do
         :ok ->
           :ok
 
@@ -853,7 +878,15 @@ defmodule SymphonyElixir.Orchestrator do
           "codex_last_reported_output_tokens" => Map.get(blocked_entry, :codex_last_reported_output_tokens, 0),
           "codex_last_reported_total_tokens" => Map.get(blocked_entry, :codex_last_reported_total_tokens, 0),
           "codex_max_reported_tokens" => Map.get(blocked_entry, :codex_max_reported_tokens, 0),
-          "codex_max_command_output_delta_bytes" => Map.get(blocked_entry, :codex_max_command_output_delta_bytes, 0)
+          "codex_max_reported_token_delta" => Map.get(blocked_entry, :codex_max_reported_token_delta, 0),
+          "codex_max_command_output_delta_bytes" => Map.get(blocked_entry, :codex_max_command_output_delta_bytes, 0),
+          "codex_max_command_events" => Map.get(blocked_entry, :codex_max_command_events, 0),
+          "codex_home" => Map.get(blocked_entry, :codex_home),
+          "codex_app_server_archive_root" => Map.get(blocked_entry, :codex_app_server_archive_root),
+          "codex_app_server_archive_dir" => Map.get(blocked_entry, :codex_app_server_archive_dir),
+          "codex_app_server_archive_file_count" => Map.get(blocked_entry, :codex_app_server_archive_file_count, 0),
+          "recent_codex_events" => Map.get(blocked_entry, :codex_recent_events, []),
+          "token_jumps" => Map.get(blocked_entry, :codex_token_jumps, [])
         }
 
         with :ok <- File.mkdir_p(Path.dirname(path)),
@@ -885,9 +918,11 @@ defmodule SymphonyElixir.Orchestrator do
       "- last_codex_timestamp: #{timestamp_text(Map.get(blocked_entry, :last_codex_timestamp))}",
       "- codex_reported_tokens: #{Map.get(blocked_entry, :codex_last_reported_total_tokens, 0)}/#{Map.get(blocked_entry, :codex_max_reported_tokens, 0)}",
       "- codex_accumulated_tokens: #{Map.get(blocked_entry, :codex_total_tokens, 0)}",
+      "- largest_token_jump: #{largest_token_jump_text(Map.get(blocked_entry, :codex_token_jumps, []))}",
+      "- codex_archive_dir: #{Map.get(blocked_entry, :codex_app_server_archive_dir) || "unavailable"}",
       "- block_provenance_path: #{@block_provenance_relative_path}",
       "",
-      "The issue was moved to Human Review/In Review so Symphony does not silently redispatch it. After reducing prompt/context/output pressure or fixing the blocker, move it back to an active state intentionally."
+      "The issue was moved to Rework so Symphony does not silently redispatch it. After reducing prompt/context/output pressure or fixing the blocker, move it back to an active state intentionally."
     ]
     |> Enum.join("\n")
   end
@@ -917,7 +952,102 @@ defmodule SymphonyElixir.Orchestrator do
   defp codex_event_name(%{event: event}) when is_binary(event), do: event
   defp codex_event_name(%{"method" => method}) when is_binary(method), do: method
   defp codex_event_name(%{method: method}) when is_binary(method), do: method
+  defp codex_event_name(event) when is_atom(event), do: Atom.to_string(event)
+  defp codex_event_name(event) when is_binary(event), do: event
   defp codex_event_name(_event), do: "unknown"
+
+  defp largest_token_jump_text(jumps) when is_list(jumps) do
+    jumps
+    |> Enum.max_by(fn jump -> Map.get(jump, "total_delta", 0) end, fn -> nil end)
+    |> case do
+      %{"total_delta" => delta, "reported_total" => total, "method" => method} ->
+        "#{delta} tokens to #{total} via #{method || "unknown"}"
+
+      _ ->
+        "unavailable"
+    end
+  end
+
+  defp largest_token_jump_text(_jumps), do: "unavailable"
+
+  defp archive_codex_home_for_block(blocked_entry) do
+    home = Map.get(blocked_entry, :codex_home)
+    archive_root = Map.get(blocked_entry, :codex_app_server_archive_root)
+
+    cond do
+      not is_binary(home) or home == "" ->
+        blocked_entry
+
+      not is_binary(archive_root) or archive_root == "" ->
+        blocked_entry
+
+      not File.dir?(home) ->
+        archive_dir = Path.join(archive_root, Path.basename(home))
+
+        if File.dir?(archive_dir) do
+          blocked_entry
+          |> Map.put(:codex_app_server_archive_dir, archive_dir)
+          |> Map.put(:codex_app_server_archive_file_count, archive_file_count(archive_dir))
+        else
+          blocked_entry
+        end
+
+      true ->
+        archive_dir = Path.join(archive_root, Path.basename(home))
+
+        file_count =
+          home
+          |> safe_archive_files()
+          |> Enum.reduce(0, fn source, count ->
+            relative = Path.relative_to(source, home)
+            destination = Path.join(archive_dir, relative)
+
+            case File.mkdir_p(Path.dirname(destination)) do
+              :ok ->
+                case File.cp(source, destination) do
+                  :ok -> count + 1
+                  {:error, _reason} -> count
+                end
+
+              {:error, _reason} ->
+                count
+            end
+          end)
+
+        blocked_entry
+        |> Map.put(:codex_app_server_archive_dir, archive_dir)
+        |> Map.put(:codex_app_server_archive_file_count, file_count)
+    end
+  end
+
+  defp safe_archive_files(home) do
+    case File.ls(home) do
+      {:ok, _entries} ->
+        home
+        |> Path.join("**/*")
+        |> Path.wildcard()
+        |> Enum.filter(&File.regular?/1)
+        |> Enum.filter(&safe_archive_file?/1)
+
+      {:error, _reason} ->
+        []
+    end
+  end
+
+  defp safe_archive_file?(path) when is_binary(path) do
+    Path.basename(path) in [
+      "selected-model",
+      ".codex-app-server-home",
+      ".codex-app-server-owner.pid"
+    ] or Path.extname(path) in [".jsonl", ".log"]
+  end
+
+  defp archive_file_count(path) when is_binary(path) do
+    path
+    |> Path.join("**/*")
+    |> Path.wildcard()
+    |> Enum.count(&File.regular?/1)
+  end
 
   defp choose_issues(issues, state) do
     active_states = active_state_set()
@@ -1134,6 +1264,9 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_input_tokens: 0,
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
+            codex_last_token_delta_total: 0,
+            codex_recent_events: [],
+            codex_token_jumps: [],
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()
@@ -1649,6 +1782,10 @@ defmodule SymphonyElixir.Orchestrator do
        running: running,
        retrying: retrying,
        blocked: blocked,
+       agent_pools: %{
+         codex: %{active: length(running), max: state.max_concurrent_agents || Config.settings!().agent.max_concurrent_agents},
+         claude: %{active: 0, max: 5}
+       },
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1683,10 +1820,13 @@ defmodule SymphonyElixir.Orchestrator do
     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
     codex_total_tokens = Map.get(running_entry, :codex_total_tokens, 0)
     codex_app_server_pid = Map.get(running_entry, :codex_app_server_pid)
+    codex_home = Map.get(running_entry, :codex_home)
+    codex_archive_root = Map.get(running_entry, :codex_app_server_archive_root)
     last_reported_input = Map.get(running_entry, :codex_last_reported_input_tokens, 0)
     last_reported_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
+    event_snapshot = codex_event_snapshot(update, token_delta)
 
     {
       Map.merge(running_entry, %{
@@ -1695,12 +1835,17 @@ defmodule SymphonyElixir.Orchestrator do
         session_id: session_id_for_update(running_entry.session_id, update),
         last_codex_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
+        codex_home: codex_home_for_update(codex_home, update),
+        codex_app_server_archive_root: codex_archive_root_for_update(codex_archive_root, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
         codex_total_tokens: codex_total_tokens + token_delta.total_tokens,
         codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
+        codex_last_token_delta_total: token_delta.total_tokens,
+        codex_recent_events: append_limited(Map.get(running_entry, :codex_recent_events, []), event_snapshot, 20),
+        codex_token_jumps: append_token_jump(Map.get(running_entry, :codex_token_jumps, []), event_snapshot),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
       }),
       token_delta
@@ -1719,6 +1864,14 @@ defmodule SymphonyElixir.Orchestrator do
     do: to_string(pid)
 
   defp codex_app_server_pid_for_update(existing, _update), do: existing
+
+  defp codex_home_for_update(_existing, %{codex_home: home}) when is_binary(home), do: home
+  defp codex_home_for_update(existing, _update), do: existing
+
+  defp codex_archive_root_for_update(_existing, %{codex_app_server_archive_root: root}) when is_binary(root),
+    do: root
+
+  defp codex_archive_root_for_update(existing, _update), do: existing
 
   defp session_id_for_update(_existing, %{session_id: session_id}) when is_binary(session_id),
     do: session_id
@@ -1749,6 +1902,46 @@ defmodule SymphonyElixir.Orchestrator do
       message: update[:payload] || update[:raw],
       timestamp: update[:timestamp]
     }
+  end
+
+  defp codex_event_snapshot(update, token_delta) do
+    payload = update[:payload] || Map.get(update, "payload") || Map.get(update, :payload)
+    raw_payload = wrapped_codex_payload(payload)
+    method = Event.method(raw_payload || payload || %{})
+    command = Event.command(raw_payload || payload || %{})
+
+    %{
+      "event" => codex_event_name(update[:event]),
+      "method" => method,
+      "command" => command,
+      "timestamp" => timestamp_text(update[:timestamp]),
+      "input_delta" => token_delta.input_tokens,
+      "output_delta" => token_delta.output_tokens,
+      "total_delta" => token_delta.total_tokens,
+      "reported_input" => token_delta.input_reported,
+      "reported_output" => token_delta.output_reported,
+      "reported_total" => token_delta.total_reported
+    }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
+
+  defp wrapped_codex_payload(%{payload: payload}) when is_map(payload), do: payload
+  defp wrapped_codex_payload(%{"payload" => payload}) when is_map(payload), do: payload
+  defp wrapped_codex_payload(_payload), do: nil
+
+  defp append_token_jump(jumps, %{"total_delta" => delta} = snapshot)
+       when is_list(jumps) and is_integer(delta) and delta > 0 do
+    append_limited(jumps, snapshot, 20)
+  end
+
+  defp append_token_jump(jumps, _snapshot) when is_list(jumps), do: jumps
+  defp append_token_jump(_jumps, _snapshot), do: []
+
+  defp append_limited(values, value, limit) when is_list(values) and is_integer(limit) do
+    values
+    |> Kernel.++([value])
+    |> Enum.take(-limit)
   end
 
   defp schedule_tick(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do

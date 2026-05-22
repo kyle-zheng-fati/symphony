@@ -74,6 +74,21 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
            total_tokens: 268_500,
            seconds_running: 4_321
          },
+         agent_pools: %{
+           codex: %{active: 2, max: 5},
+           claude: %{
+             active: 1,
+             max: 5,
+             sessions: [
+               %{
+                 identifier: "CLA-1",
+                 state: "In Progress",
+                 session: "agent-claude-CLA-1",
+                 mode: "print"
+               }
+             ]
+           }
+         },
          rate_limits: %{
            limit_id: "gpt-5",
            primary: %{remaining: 12_345, limit: 20_000, reset_in_seconds: 30},

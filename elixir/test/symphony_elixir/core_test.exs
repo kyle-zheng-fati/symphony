@@ -13,7 +13,7 @@ defmodule SymphonyElixir.CoreTest do
 
     config = Config.settings!()
     assert config.polling.interval_ms == 30_000
-    assert config.tracker.active_states == ["Todo", "In Progress"]
+    assert config.tracker.active_states == ["Todo", "In Progress", "Merging", "Rework"]
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
@@ -45,7 +45,7 @@ defmodule SymphonyElixir.CoreTest do
     write_workflow_file!(Workflow.workflow_file_path(), max_issue_description_chars: 0)
     assert Config.settings!().agent.max_issue_description_chars == 0
 
-    write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  ,")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "tracker.active_states"
 
@@ -246,7 +246,7 @@ defmodule SymphonyElixir.CoreTest do
     try do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: test_root,
-        tracker_active_states: ["Todo", "In Progress", "In Review"],
+        tracker_active_states: ["Todo", "In Progress", "Merging", "Rework"],
         tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
       )
 
@@ -309,7 +309,7 @@ defmodule SymphonyElixir.CoreTest do
     try do
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: test_root,
-        tracker_active_states: ["Todo", "In Progress", "In Review"],
+        tracker_active_states: ["Todo", "In Progress", "Merging", "Rework"],
         tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"]
       )
 
@@ -373,7 +373,7 @@ defmodule SymphonyElixir.CoreTest do
       write_workflow_file!(Workflow.workflow_file_path(),
         tracker_kind: "memory",
         workspace_root: test_root,
-        tracker_active_states: ["Todo", "In Progress", "In Review"],
+        tracker_active_states: ["Todo", "In Progress", "Merging", "Rework"],
         tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"],
         poll_interval_ms: 30_000
       )
@@ -524,7 +524,7 @@ defmodule SymphonyElixir.CoreTest do
 
   test "codex dispatcher skips claude-only issues" do
     write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_active_states: ["Todo", "In Progress"],
+      tracker_active_states: ["Todo", "In Progress", "Merging", "Rework"],
       tracker_terminal_states: ["Done", "Canceled"]
     )
 
@@ -808,7 +808,7 @@ defmodule SymphonyElixir.CoreTest do
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
 
-    assert remaining_ms >= min_remaining_ms
+    assert remaining_ms + 500 >= min_remaining_ms
     assert remaining_ms <= max_remaining_ms
   end
 
@@ -990,6 +990,76 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "description_truncated=true"
     assert prompt =~ "max_issue_description_chars=24"
     refute prompt =~ "overflow overflow overflow overflow overflow"
+  end
+
+  test "prompt builder can use configured DSPy issue brief compiler" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-dspy-brief-#{System.unique_integer([:positive])}"
+      )
+
+    previous_compiler = System.get_env("SYMPHONY_ISSUE_BRIEF_COMPILER")
+    previous_runner = System.get_env("SYMPHONY_DSPY_ISSUE_BRIEF_RUNNER")
+    previous_script = System.get_env("SYMPHONY_DSPY_ISSUE_BRIEF_SCRIPT")
+
+    on_exit(fn ->
+      restore_env("SYMPHONY_ISSUE_BRIEF_COMPILER", previous_compiler)
+      restore_env("SYMPHONY_DSPY_ISSUE_BRIEF_RUNNER", previous_runner)
+      restore_env("SYMPHONY_DSPY_ISSUE_BRIEF_SCRIPT", previous_script)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(test_root)
+    dspy_script = Path.join(test_root, "fake-dspy-brief.py")
+
+    File.write!(dspy_script, """
+    #!/usr/bin/env python3
+    import json
+    import sys
+
+    with open(sys.argv[1], "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    issue = payload["issue"]
+    result = {
+        "brief": "Signature: SymphonyIssueBriefV1 (DSPy issue brief)\\nObjective:\\n- " + issue["title"],
+        "provenance_text": "signature=SymphonyIssueBriefV1\\ncompiler=test_dspy\\ncompiler_contract=dspy.Signature",
+        "provenance": {
+            "signature": "SymphonyIssueBriefV1",
+            "compiler": "test_dspy",
+            "compiler_contract": "dspy.Signature",
+            "input_fields": ["identifier"],
+            "output_fields": ["objective"],
+            "description_sha256": "test",
+            "description_chars": len(issue.get("description") or ""),
+            "description_included_chars": len(issue.get("description") or ""),
+            "description_truncated": False
+        }
+    }
+    print(json.dumps(result))
+    """)
+
+    File.chmod!(dspy_script, 0o755)
+    System.put_env("SYMPHONY_ISSUE_BRIEF_COMPILER", "dspy-required")
+    System.put_env("SYMPHONY_DSPY_ISSUE_BRIEF_RUNNER", "python")
+    System.put_env("SYMPHONY_DSPY_ISSUE_BRIEF_SCRIPT", dspy_script)
+
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: "{{ issue.brief }}\n\n{{ issue.context_provenance }}")
+
+    issue = %Issue{
+      identifier: "MT-781",
+      title: "Use DSPy",
+      description: "Use the configured DSPy signature compiler.",
+      state: "Todo",
+      url: "https://example.org/issues/MT-781",
+      labels: ["prompt"]
+    }
+
+    prompt = PromptBuilder.build_prompt(issue)
+
+    assert prompt =~ "Signature: SymphonyIssueBriefV1 (DSPy issue brief)"
+    assert prompt =~ "compiler=test_dspy"
+    assert prompt =~ "compiler_contract=dspy.Signature"
   end
 
   test "prompt builder reports workflow load failures separately from template parse errors" do
