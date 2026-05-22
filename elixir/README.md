@@ -23,6 +23,11 @@ This directory contains the current Elixir/OTP implementation of Symphony, based
 During app-server sessions, Symphony also serves a client-side `linear_graphql` tool so that repo
 skills can make raw Linear GraphQL calls.
 
+For unattended workflows, a worker can report its final disposition by writing
+`.symphony/outcome.json` in the workspace. Symphony reads that file after a successful turn and moves
+the issue to `Done`, `Merging`, or `Human Review` according to the reported status and whether the
+workspace still has unmerged changes.
+
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
 

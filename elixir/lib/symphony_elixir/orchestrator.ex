@@ -31,6 +31,7 @@ defmodule SymphonyElixir.Orchestrator do
       :max_concurrent_agents,
       :next_poll_due_at_ms,
       :poll_check_in_progress,
+      :linear_cooldown_until_ms,
       :tick_timer_ref,
       :tick_token,
       running: %{},
@@ -59,6 +60,7 @@ defmodule SymphonyElixir.Orchestrator do
       max_concurrent_agents: config.agent.max_concurrent_agents,
       next_poll_due_at_ms: now_ms,
       poll_check_in_progress: false,
+      linear_cooldown_until_ms: nil,
       tick_timer_ref: nil,
       tick_token: nil,
       codex_totals: @empty_codex_totals,
@@ -110,7 +112,7 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
     state = maybe_dispatch(state)
-    state = schedule_tick(state, state.poll_interval_ms)
+    state = schedule_tick(state, next_poll_delay_ms(state))
     state = %{state | poll_check_in_progress: false}
 
     notify_dashboard()
@@ -244,56 +246,71 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state) do
-    state =
+    state = maybe_clear_linear_cooldown(state)
+
+    if linear_cooldown_active?(state) do
       state
-      |> reconcile_running_issues()
-      |> reconcile_blocked_issues()
-
-    with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_candidate_issues(),
-         true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
     else
-      {:error, :missing_linear_api_token} ->
-        Logger.error("Linear API token missing in WORKFLOW.md")
+      state =
         state
+        |> reconcile_running_issues()
+        |> reconcile_blocked_issues()
 
-      {:error, :missing_linear_project_slug} ->
-        Logger.error("Linear project slug missing in WORKFLOW.md")
+      if linear_cooldown_active?(state) do
         state
+      else
+        with :ok <- Config.validate!(),
+             {:ok, issues} <- Tracker.fetch_candidate_issues(),
+             true <- available_slots(state) > 0 do
+          choose_issues(issues, state)
+        else
+          {:error, :missing_linear_api_token} ->
+            Logger.error("Linear API token missing in WORKFLOW.md")
+            state
 
-      {:error, :missing_tracker_kind} ->
-        Logger.error("Tracker kind missing in WORKFLOW.md")
+          {:error, :missing_linear_project_slug} ->
+            Logger.error("Linear project slug missing in WORKFLOW.md")
+            state
 
-        state
+          {:error, :missing_tracker_kind} ->
+            Logger.error("Tracker kind missing in WORKFLOW.md")
 
-      {:error, {:unsupported_tracker_kind, kind}} ->
-        Logger.error("Unsupported tracker kind in WORKFLOW.md: #{inspect(kind)}")
+            state
 
-        state
+          {:error, {:unsupported_tracker_kind, kind}} ->
+            Logger.error("Unsupported tracker kind in WORKFLOW.md: #{inspect(kind)}")
 
-      {:error, {:invalid_workflow_config, message}} ->
-        Logger.error("Invalid WORKFLOW.md config: #{message}")
-        state
+            state
 
-      {:error, {:missing_workflow_file, path, reason}} ->
-        Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
-        state
+          {:error, {:invalid_workflow_config, message}} ->
+            Logger.error("Invalid WORKFLOW.md config: #{message}")
+            state
 
-      {:error, :workflow_front_matter_not_a_map} ->
-        Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
-        state
+          {:error, {:missing_workflow_file, path, reason}} ->
+            Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
+            state
 
-      {:error, {:workflow_parse_error, reason}} ->
-        Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
-        state
+          {:error, :workflow_front_matter_not_a_map} ->
+            Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
+            state
 
-      {:error, reason} ->
-        Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
-        state
+          {:error, {:workflow_parse_error, reason}} ->
+            Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
+            state
 
-      false ->
-        state
+          {:error, reason} ->
+            state = enter_linear_cooldown(state, reason, "candidate issue fetch")
+
+            unless linear_rate_limited?(reason) do
+              Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
+            end
+
+            state
+
+          false ->
+            state
+        end
+      end
     end
   end
 
@@ -317,7 +334,7 @@ defmodule SymphonyElixir.Orchestrator do
         {:error, reason} ->
           Logger.debug("Failed to refresh running issue states: #{inspect(reason)}; keeping active workers")
 
-          state
+          enter_linear_cooldown(state, reason, "running issue refresh")
       end
     end
   end
@@ -341,7 +358,7 @@ defmodule SymphonyElixir.Orchestrator do
         {:error, reason} ->
           Logger.debug("Failed to refresh blocked issue states: #{inspect(reason)}; keeping blocked issues")
 
-          state
+          enter_linear_cooldown(state, reason, "blocked issue refresh")
       end
     end
   end
@@ -839,11 +856,23 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
 
-  defp issue_routable_to_worker?(%Issue{assigned_to_worker: assigned_to_worker})
+  defp issue_routable_to_worker?(%Issue{assigned_to_worker: assigned_to_worker, labels: labels})
        when is_boolean(assigned_to_worker),
-       do: assigned_to_worker
+       do: assigned_to_worker and issue_label_routable_to_codex?(labels)
 
   defp issue_routable_to_worker?(_issue), do: true
+
+  defp issue_label_routable_to_codex?(labels) when is_list(labels) do
+    normalized_labels =
+      labels
+      |> Enum.map(&to_string/1)
+      |> Enum.map(&String.downcase(String.trim(&1)))
+      |> MapSet.new()
+
+    not (MapSet.member?(normalized_labels, "claude") and not MapSet.member?(normalized_labels, "codex"))
+  end
+
+  defp issue_label_routable_to_codex?(_labels), do: true
 
   defp todo_issue_blocked_by_non_terminal?(
          %Issue{state: issue_state, blocked_by: blockers},
@@ -1068,13 +1097,16 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.warning("Retry poll failed for issue_id=#{issue_id} issue_identifier=#{metadata[:identifier] || issue_id}: #{inspect(reason)}")
+        state = enter_linear_cooldown(state, reason, "retry issue poll")
 
         {:noreply,
          schedule_issue_retry(
            state,
            issue_id,
            attempt + 1,
-           Map.merge(metadata, %{error: "retry poll failed: #{inspect(reason)}"})
+           metadata
+           |> Map.merge(%{error: "retry poll failed: #{inspect(reason)}"})
+           |> maybe_put_linear_retry_delay(reason)
          )}
     end
   end
@@ -1169,11 +1201,67 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
-  defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
-    if metadata[:delay_type] == :continuation and attempt == 1 do
-      @continuation_retry_delay_ms
+  defp maybe_clear_linear_cooldown(%State{linear_cooldown_until_ms: until_ms} = state)
+       when is_integer(until_ms) do
+    if until_ms <= System.monotonic_time(:millisecond) do
+      %{state | linear_cooldown_until_ms: nil}
     else
-      failure_retry_delay(attempt)
+      state
+    end
+  end
+
+  defp maybe_clear_linear_cooldown(%State{} = state), do: state
+
+  defp linear_cooldown_active?(%State{linear_cooldown_until_ms: until_ms})
+       when is_integer(until_ms) do
+    until_ms > System.monotonic_time(:millisecond)
+  end
+
+  defp linear_cooldown_active?(%State{}), do: false
+
+  defp enter_linear_cooldown(%State{} = state, reason, context) do
+    case linear_rate_limit_cooldown_ms(reason) do
+      nil ->
+        state
+
+      cooldown_ms ->
+        now_ms = System.monotonic_time(:millisecond)
+        until_ms = now_ms + cooldown_ms
+        current_until_ms = state.linear_cooldown_until_ms || 0
+        effective_until_ms = max(until_ms, current_until_ms)
+        effective_cooldown_ms = max(0, effective_until_ms - now_ms)
+
+        Logger.warning("Linear rate limit hit during #{context}; pausing Linear polling for #{effective_cooldown_ms}ms")
+
+        %{state | linear_cooldown_until_ms: effective_until_ms}
+    end
+  end
+
+  defp maybe_put_linear_retry_delay(metadata, reason) when is_map(metadata) do
+    case linear_rate_limit_cooldown_ms(reason) do
+      nil -> metadata
+      cooldown_ms -> Map.put(metadata, :delay_ms, cooldown_ms)
+    end
+  end
+
+  defp linear_rate_limited?(reason), do: not is_nil(linear_rate_limit_cooldown_ms(reason))
+
+  defp linear_rate_limit_cooldown_ms({:linear_rate_limited, cooldown_ms})
+       when is_integer(cooldown_ms) and cooldown_ms > 0,
+       do: cooldown_ms
+
+  defp linear_rate_limit_cooldown_ms(_reason), do: nil
+
+  defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
+    cond do
+      is_integer(metadata[:delay_ms]) and metadata[:delay_ms] > 0 ->
+        metadata[:delay_ms]
+
+      metadata[:delay_type] == :continuation and attempt == 1 ->
+        @continuation_retry_delay_ms
+
+      true ->
+        failure_retry_delay(attempt)
     end
   end
 
@@ -1523,6 +1611,16 @@ defmodule SymphonyElixir.Orchestrator do
         tick_token: tick_token,
         next_poll_due_at_ms: System.monotonic_time(:millisecond) + delay_ms
     }
+  end
+
+  defp next_poll_delay_ms(%State{} = state) do
+    case state.linear_cooldown_until_ms do
+      until_ms when is_integer(until_ms) ->
+        max(0, until_ms - System.monotonic_time(:millisecond))
+
+      _ ->
+        state.poll_interval_ms
+    end
   end
 
   defp schedule_poll_cycle_start do

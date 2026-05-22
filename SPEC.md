@@ -1199,11 +1199,14 @@ Orchestrator behavior on tracker errors:
 
 ### 11.5 Tracker Writes (Important Boundary)
 
-Symphony does not require first-class tracker write APIs in the orchestrator.
+Symphony does not require first-class tracker write APIs in the orchestrator, but unattended
+workflows may opt into host-owned finalization through a workspace outcome file.
 
 - Ticket mutations (state transitions, comments, PR metadata) are typically handled by the coding
   agent using tools defined by the workflow prompt.
-- The service remains a scheduler/runner and tracker reader.
+- The service remains a scheduler/runner and tracker reader unless the workflow asks workers to
+  write `.symphony/outcome.json`; in that case, the host runner may convert `done`, `needs_merge`,
+  `needs_review`, or `blocked` into the workflow's tracker states.
 - Workflow-specific success often means "reached the next handoff state" (for example
   `Human Review`) rather than tracker terminal state `Done`.
 - If the `linear_graphql` client-side tool extension is implemented, it is still part of the agent

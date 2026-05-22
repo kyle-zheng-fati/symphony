@@ -7,6 +7,8 @@ defmodule SymphonyElixir.AgentRunner do
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
 
+  @outcome_relative_path Path.join([".symphony", "outcome.json"])
+
   @type worker_host :: String.t() | nil
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
@@ -80,12 +82,21 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
-      try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
-      after
-        AppServer.stop_session(session)
-      end
+    case finalize_reported_outcome(workspace, issue) do
+      :finalized ->
+        :ok
+
+      :no_outcome ->
+        with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+          try do
+            do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+          after
+            AppServer.stop_session(session)
+          end
+        end
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -101,32 +112,135 @@ defmodule SymphonyElixir.AgentRunner do
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
-        {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+      case finalize_reported_outcome(workspace, issue) do
+        :no_outcome ->
+          case continue_with_issue?(issue, issue_state_fetcher) do
+            {:continue, refreshed_issue} when turn_number < max_turns ->
+              Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
-          do_run_codex_turns(
-            app_session,
-            workspace,
-            refreshed_issue,
-            codex_update_recipient,
-            opts,
-            issue_state_fetcher,
-            turn_number + 1,
-            max_turns
-          )
+              do_run_codex_turns(
+                app_session,
+                workspace,
+                refreshed_issue,
+                codex_update_recipient,
+                opts,
+                issue_state_fetcher,
+                turn_number + 1,
+                max_turns
+              )
 
-        {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+            {:continue, refreshed_issue} ->
+              Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
-          :ok
+              :ok
 
-        {:done, _refreshed_issue} ->
+            {:done, _refreshed_issue} ->
+              :ok
+
+            {:error, reason} ->
+              {:error, reason}
+          end
+
+        :finalized ->
           :ok
 
         {:error, reason} ->
           {:error, reason}
       end
+    end
+  end
+
+  defp finalize_reported_outcome(workspace, %Issue{id: issue_id} = issue) when is_binary(issue_id) do
+    outcome_path = Path.join(workspace, @outcome_relative_path)
+
+    case File.read(outcome_path) do
+      {:ok, body} ->
+        with {:ok, payload} <- Jason.decode(body),
+             {:ok, status} <- outcome_status(payload),
+             {:ok, target_states} <- outcome_target_states(status, workspace) do
+          case update_issue_state_candidates(issue_id, target_states) do
+            :ok ->
+              Logger.info("Finalized #{issue_context(issue)} from #{@outcome_relative_path} status=#{status} target_states=#{inspect(target_states)}")
+              :finalized
+
+            {:error, reason} ->
+              {:error, {:outcome_state_update_failed, target_states, reason}}
+          end
+        else
+          :no_outcome -> :no_outcome
+          {:error, reason} -> {:error, {:invalid_outcome_file, outcome_path, reason}}
+        end
+
+      {:error, :enoent} ->
+        :no_outcome
+
+      {:error, reason} ->
+        {:error, {:outcome_read_failed, outcome_path, reason}}
+    end
+  end
+
+  defp finalize_reported_outcome(_workspace, _issue), do: :no_outcome
+
+  defp outcome_status(%{"status" => status}) when is_binary(status) do
+    normalized =
+      status
+      |> String.trim()
+      |> String.downcase()
+      |> String.replace("-", "_")
+      |> String.replace(" ", "_")
+
+    if normalized == "" do
+      {:error, :missing_status}
+    else
+      {:ok, normalized}
+    end
+  end
+
+  defp outcome_status(_payload), do: {:error, :missing_status}
+
+  defp outcome_target_states(status, _workspace) when status in ["needs_merge", "merge", "merging"], do: {:ok, ["Merging", "In Review"]}
+
+  defp outcome_target_states(status, _workspace) when status in ["needs_review", "human_review", "review", "blocked", "needs_human"],
+    do: {:ok, ["Human Review", "In Review"]}
+
+  defp outcome_target_states(status, _workspace) when status in ["continue", "in_progress"], do: :no_outcome
+
+  defp outcome_target_states("done", workspace) do
+    if git_dirty?(workspace) do
+      Logger.warning("Outcome status=done but workspace is dirty; routing to Merging instead of Done workspace=#{workspace}")
+      {:ok, ["Merging", "In Review"]}
+    else
+      {:ok, ["Done"]}
+    end
+  end
+
+  defp outcome_target_states(status, _workspace), do: {:error, {:unknown_status, status}}
+
+  defp update_issue_state_candidates(issue_id, [state_name | rest]) do
+    case Tracker.update_issue_state(issue_id, state_name) do
+      :ok ->
+        :ok
+
+      {:error, :state_not_found} when rest != [] ->
+        update_issue_state_candidates(issue_id, rest)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp update_issue_state_candidates(_issue_id, []), do: {:error, :state_not_found}
+
+  defp git_dirty?(workspace) do
+    case System.cmd("git", ["-C", workspace, "status", "--porcelain", "--untracked-files=all"], stderr_to_stdout: true) do
+      {output, 0} ->
+        output
+        |> String.split("\n", trim: true)
+        |> Enum.reject(&String.ends_with?(&1, @outcome_relative_path))
+        |> Enum.any?()
+
+      _ ->
+        false
     end
   end
 

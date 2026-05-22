@@ -514,6 +514,53 @@ defmodule SymphonyElixir.CoreTest do
     refute Process.alive?(agent_pid)
   end
 
+  test "codex dispatcher skips claude-only issues" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress"],
+      tracker_terminal_states: ["Done", "Canceled"]
+    )
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{},
+      claimed: MapSet.new(),
+      blocked: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    claude_issue = %Issue{
+      id: "issue-claude-only",
+      identifier: "MT-CLAUDE",
+      title: "Claude architecture issue",
+      state: "Todo",
+      labels: ["claude", "needs-architecture"],
+      assigned_to_worker: true
+    }
+
+    codex_issue = %Issue{
+      id: "issue-codex",
+      identifier: "MT-CODEX",
+      title: "Codex implementation issue",
+      state: "Todo",
+      labels: ["codex", "needs-implementation"],
+      assigned_to_worker: true
+    }
+
+    dual_label_issue = %Issue{
+      id: "issue-dual",
+      identifier: "MT-DUAL",
+      title: "Explicit dual-routed issue",
+      state: "Todo",
+      labels: ["claude", "codex"],
+      assigned_to_worker: true
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(claude_issue, state)
+    assert Orchestrator.should_dispatch_issue_for_test(codex_issue, state)
+    assert Orchestrator.should_dispatch_issue_for_test(dual_label_issue, state)
+  end
+
   test "normal worker exit schedules active-state continuation retry" do
     issue_id = "issue-resume"
     ref = make_ref()
@@ -1458,6 +1505,71 @@ defmodule SymphonyElixir.CoreTest do
       assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 2
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner finalizes issues from workspace outcome file" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-outcome-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+
+      File.mkdir_p!(test_root)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-outcome"}}}'
+            ;;
+          4)
+            mkdir -p .symphony
+            printf '%s\\n' '{"status":"done","summary":"validated"}' > .symphony/outcome.json
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-outcome"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        max_turns: 3
+      )
+
+      issue = %Issue{
+        id: "issue-outcome",
+        identifier: "MT-249",
+        title: "Finalize from outcome",
+        description: "Worker reports completion",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-249",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue)
+      assert_receive {:memory_tracker_state_update, "issue-outcome", "Done"}, 500
+    after
       File.rm_rf(test_root)
     end
   end

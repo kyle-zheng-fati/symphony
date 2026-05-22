@@ -6,6 +6,7 @@ defmodule SymphonyElixir.Linear.Client do
   require Logger
   alias SymphonyElixir.{Config, Linear.Issue}
 
+  @default_rate_limit_cooldown_ms 3_600_000
   @issue_page_size 50
   @max_error_body_log_bytes 1_000
 
@@ -176,7 +177,7 @@ defmodule SymphonyElixir.Linear.Client do
             linear_error_context(payload, response)
         )
 
-        {:error, {:linear_api_status, response.status}}
+        {:error, linear_error_reason(response)}
 
       {:error, reason} ->
         Logger.error("Linear GraphQL request failed: #{inspect(reason)}")
@@ -357,6 +358,50 @@ defmodule SymphonyElixir.Linear.Client do
 
     operation_name <> " body=" <> body
   end
+
+  defp linear_error_reason(%{status: status, body: body}) do
+    case linear_rate_limit_cooldown_ms(body) do
+      nil -> {:linear_api_status, status}
+      cooldown_ms -> {:linear_rate_limited, cooldown_ms}
+    end
+  end
+
+  defp linear_rate_limit_cooldown_ms(%{"errors" => errors}) when is_list(errors) do
+    Enum.find_value(errors, &rate_limit_error_cooldown_ms/1)
+  end
+
+  defp linear_rate_limit_cooldown_ms(_body), do: nil
+
+  defp rate_limit_error_cooldown_ms(%{"extensions" => extensions} = error) when is_map(extensions) do
+    cond do
+      extensions["code"] == "RATELIMITED" ->
+        duration =
+          get_in(extensions, ["meta", "rateLimitResult", "duration"]) ||
+            get_in(error, ["extensions", "meta", "rateLimitResult", "duration"])
+
+        normalize_cooldown_ms(duration)
+
+      extensions["statusCode"] == 429 or error["statusCode"] == 429 ->
+        @default_rate_limit_cooldown_ms
+
+      true ->
+        nil
+    end
+  end
+
+  defp rate_limit_error_cooldown_ms(%{"statusCode" => 429}), do: @default_rate_limit_cooldown_ms
+  defp rate_limit_error_cooldown_ms(_error), do: nil
+
+  defp normalize_cooldown_ms(value) when is_integer(value) and value > 0, do: value
+
+  defp normalize_cooldown_ms(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {int, ""} when int > 0 -> int
+      _ -> @default_rate_limit_cooldown_ms
+    end
+  end
+
+  defp normalize_cooldown_ms(_value), do: @default_rate_limit_cooldown_ms
 
   defp summarize_error_body(body) when is_binary(body) do
     body
