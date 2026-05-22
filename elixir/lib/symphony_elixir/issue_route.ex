@@ -196,7 +196,7 @@ defmodule SymphonyElixir.IssueRoute do
     script = System.get_env("SYMPHONY_DSPY_ISSUE_ROUTE_SCRIPT", @dspy_script)
 
     if File.regular?(script) do
-      case System.get_env("SYMPHONY_DSPY_ISSUE_ROUTE_RUNNER", System.get_env("SYMPHONY_DSPY_ISSUE_BRIEF_RUNNER", "uv"))
+      case System.get_env("SYMPHONY_DSPY_ISSUE_ROUTE_RUNNER", "python")
            |> String.trim()
            |> String.downcase() do
         "python" ->
